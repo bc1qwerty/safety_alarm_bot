@@ -1,0 +1,50 @@
+name: Check Safety Notices
+
+on:
+  schedule:
+    # UTC 기준 (KST = UTC+9)
+    # KST 08:00~18:00 사이 30분 간격 실행
+    # UTC 23:00~09:00
+    - cron: '0,30 23 * * 0-4'   # KST 08:00, 08:30 (월~금)
+    - cron: '0,30 0-9 * * 1-5'  # KST 09:00~18:30 (월~금)
+  workflow_dispatch:  # 수동 실행
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BAND_ACCESS_TOKEN: ${{ secrets.BAND_ACCESS_TOKEN }}
+          BAND_KEY: ${{ secrets.BAND_KEY }}
+        run: python main.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/last_post_ids.json
+          git diff --cached --quiet || git commit -m "chore: update last_post_ids"
+          git push
