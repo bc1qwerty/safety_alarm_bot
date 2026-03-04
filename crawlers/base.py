@@ -41,7 +41,7 @@ class BaseCrawler(ABC):
 
         new_posts = []
         for post in posts:
-            if last_id and post.post_id <= last_id:
+            if last_id and int(post.post_id) <= int(last_id):
                 break
             new_posts.append(post)
 
