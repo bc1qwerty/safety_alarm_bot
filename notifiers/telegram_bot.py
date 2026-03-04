@@ -56,20 +56,22 @@ def send_document(doc_bytes: bytes, filename: str, caption: str = "") -> bool:
 
 
 def send_photo(photo_bytes: bytes, caption: str = "") -> bool:
-    """텔레그램으로 사진 전송."""
+    """텔레그램으로 사진 전송 (원본 화질 유지 — sendDocument 방식)."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("[telegram] BOT_TOKEN 또는 CHAT_ID 미설정")
         return False
 
-    url = f"{API_URL}/sendPhoto"
+    # sendPhoto는 텔레그램이 자동 압축 → sendDocument로 전송해야 원본 화질 유지
+    url = f"{API_URL}/sendDocument"
     data = {"chat_id": TELEGRAM_CHAT_ID}
     if caption:
         data["caption"] = caption
-    files = {"photo": ("image.jpg", photo_bytes, "image/jpeg")}
+        data["parse_mode"] = "HTML"
+    files = {"document": ("image.jpg", photo_bytes, "image/jpeg")}
     try:
         resp = requests.post(url, data=data, files=files, timeout=30)
         resp.raise_for_status()
-        logger.info("[telegram] 사진 전송 성공")
+        logger.info("[telegram] 사진 전송 성공 (무압축)")
         return True
     except requests.RequestException as e:
         logger.error(f"[telegram] 사진 전송 실패: {e}")
