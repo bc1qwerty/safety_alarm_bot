@@ -1,9 +1,8 @@
-"""고용노동부 공지사항 크롤러 (requests + BeautifulSoup)."""
+"""고용노동부 공지사항 크롤러 (Scrapling)."""
 
 import logging
 
-import requests
-from bs4 import BeautifulSoup
+from scrapling.fetchers import Fetcher
 
 from crawlers.base import BaseCrawler, Post
 
@@ -19,39 +18,37 @@ class MoelCrawler(BaseCrawler):
     def fetch_posts(self) -> list[Post]:
         """고용노동부 공지사항 최신 게시글 파싱."""
         try:
-            resp = requests.get(LIST_URL, timeout=15)
-            resp.raise_for_status()
-        except requests.RequestException as e:
+            page = Fetcher(auto_match=False).get(LIST_URL, timeout=15)
+            if page.status != 200:
+                logger.error(f"[moel] HTTP {page.status}")
+                return []
+        except Exception as e:
             logger.error(f"[moel] 요청 실패: {e}")
             return []
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        rows = soup.select("table.tstyle_list tbody tr")
+        rows = page.css("table.tstyle_list tbody tr")
 
         posts = []
         for row in rows:
-            # 공지(상단고정) 행 건너뛰기
-            num_td = row.select_one("td[aria-label='번호']")
-            if not num_td:
+            num_tds = row.css("td[aria-label='번호']")
+            if not num_tds:
                 continue
-            num_text = num_td.get_text(strip=True)
+            num_text = num_tds[0].text.strip()
             if not num_text.isdigit():
                 continue
 
-            # 제목 + 링크 추출
-            link_tag = row.select_one("strong.b_tit a")
-            if not link_tag:
+            link_tags = row.css("strong.b_tit a")
+            if not link_tags:
                 continue
+            link_tag = link_tags[0]
 
-            title = link_tag.get("title") or link_tag.get_text(strip=True)
-            href = link_tag.get("href", "")
+            title = link_tag.attrib.get("title") or link_tag.text.strip()
+            href = link_tag.attrib.get("href", "")
             if href and not href.startswith("http"):
                 href = BASE_URL + href
 
-            # bbs_seq를 ID로 사용
-            post_id = num_text
             posts.append(Post(
-                post_id=post_id,
+                post_id=num_text,
                 title=title,
                 url=href,
                 source="고용노동부",
