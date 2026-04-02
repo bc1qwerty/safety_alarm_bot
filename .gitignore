@@ -4,7 +4,7 @@ __pycache__/
 venv/
 NUL
 safety-alarm-bot
-data/last_post_ids.json
+
 
 # OMC plugin state
 .omc/
