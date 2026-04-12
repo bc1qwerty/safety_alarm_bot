@@ -10,6 +10,7 @@ import (
 	"github.com/bc1qwerty/safety-alarm-bot/internal/config"
 	"github.com/bc1qwerty/safety-alarm-bot/internal/crawler"
 	"github.com/bc1qwerty/safety-alarm-bot/internal/notifier"
+	"github.com/bc1qwerty/safety-alarm-bot/internal/notifyhub"
 )
 
 func formatMessage(posts []crawler.Post, source string) string {
@@ -75,6 +76,19 @@ func main() {
 
 		bandMsg := formatBandMessage(newPosts, newPosts[0].Source)
 		notifier.BandSendPost(bandMsg)
+
+		// Push each notice to hub individually
+		for _, p := range newPosts {
+			if err := notifyhub.Push(notifyhub.Payload{
+				ChannelID: "safety-alarm",
+				Title:     p.Title,
+				Body:      p.Source,
+				URL:       p.URL,
+				Category:  p.Source,
+			}); err != nil {
+				log.Printf("hub push error: %v", err)
+			}
+		}
 	}
 
 	// 2) Accident crawler (individual send with image)
