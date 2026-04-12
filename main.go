@@ -50,6 +50,7 @@ func main() {
 	}
 
 	log.Println("=== Safety Alarm Bot started ===")
+	notifyhub.LogPush("safety-alarm-bot", "info", "run started", "")
 
 	totalNew := 0
 

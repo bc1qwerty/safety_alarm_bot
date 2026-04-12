@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -54,5 +55,33 @@ func Push(p Payload) error {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("push status %d: %s", resp.StatusCode, body)
 	}
+	return nil
+}
+
+// LogPush sends a log entry to /logs/push.
+// No-op if NOTIFICATION_HUB_URL / NOTIFICATION_SECRET is unset.
+func LogPush(source, level, message, details string) error {
+	hubURL := os.Getenv("NOTIFICATION_HUB_URL")
+	secret := os.Getenv("NOTIFICATION_SECRET")
+	if hubURL == "" || secret == "" {
+		return nil
+	}
+
+	logURL := strings.Replace(hubURL, "/notifications/push", "/logs/push", 1)
+
+	body := fmt.Sprintf(`{"source":%q,"level":%q,"message":%q,"details":%q}`, source, level, message, details)
+
+	req, err := http.NewRequest("POST", logURL, bytes.NewReader([]byte(body)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Notification-Secret", secret)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
 	return nil
 }
