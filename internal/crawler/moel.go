@@ -25,8 +25,17 @@ func NewMoelCrawler() *MoelCrawler {
 }
 
 func (c *MoelCrawler) FetchPosts() ([]Post, error) {
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(moelListURL)
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, err := http.NewRequest("GET", moelListURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("[moel] new request failed: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "ko-KR,ko;q=0.9,en;q=0.8")
+	req.Header.Set("Referer", moelBaseURL+"/news/notice/")
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("[moel] request failed: %w", err)
 	}

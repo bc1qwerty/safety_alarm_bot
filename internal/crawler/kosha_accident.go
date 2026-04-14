@@ -45,6 +45,14 @@ func (c *KoshaAccidentCrawler) FetchPosts() ([]Post, error) {
 		chromedp.Flag("no-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
 		chromedp.Flag("disable-gpu", true),
+		chromedp.Flag("no-zygote", true),
+		chromedp.Flag("disable-setuid-sandbox", true),
+		chromedp.Flag("disable-features", "Translate,OptimizationHints,MediaRouter,InterestFeedContentSuggestions,VizDisplayCompositor"),
+		chromedp.Flag("disable-extensions", true),
+		chromedp.Flag("disable-default-apps", true),
+		chromedp.Flag("disable-background-timer-throttling", true),
+		chromedp.Flag("disable-backgrounding-occluded-windows", true),
+		chromedp.Flag("disable-renderer-backgrounding", true),
 		chromedp.WindowSize(1280, 720),
 	)
 

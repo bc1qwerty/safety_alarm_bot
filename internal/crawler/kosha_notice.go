@@ -37,6 +37,14 @@ func (c *KoshaNoticeCrawler) FetchPosts() ([]Post, error) {
 		chromedp.Flag("no-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
 		chromedp.Flag("disable-gpu", true),
+		chromedp.Flag("no-zygote", true),
+		chromedp.Flag("disable-setuid-sandbox", true),
+		chromedp.Flag("disable-features", "Translate,OptimizationHints,MediaRouter,InterestFeedContentSuggestions,VizDisplayCompositor"),
+		chromedp.Flag("disable-extensions", true),
+		chromedp.Flag("disable-default-apps", true),
+		chromedp.Flag("disable-background-timer-throttling", true),
+		chromedp.Flag("disable-backgrounding-occluded-windows", true),
+		chromedp.Flag("disable-renderer-backgrounding", true),
 		chromedp.WindowSize(1280, 720),
 	)
 
@@ -50,14 +58,17 @@ func (c *KoshaNoticeCrawler) FetchPosts() ([]Post, error) {
 	defer cancel()
 
 	var baseListJSON string
-	var rowsData []map[string]string
+	var rowItems []struct {
+		Num   string `json:"num"`
+		Title string `json:"title"`
+	}
 
 	err := chromedp.Run(ctx,
 		chromedp.Navigate(koshaBoardURL),
 		chromedp.WaitVisible(".tboard_list_row", chromedp.ByQuery),
-		// Extract baseList from JS context
+		// Extract baseList from JS context (JSON.stringify so unmarshal to a Go string)
 		chromedp.Evaluate(`JSON.stringify(koshaTboard.bbsInfo.tboard.result.search.baseList)`, &baseListJSON),
-		// Extract rows data from DOM
+		// Return a native JS array of {num,title} — chromedp marshals it to []struct directly.
 		chromedp.Evaluate(`
 			(() => {
 				const rows = document.querySelectorAll('.tboard_list_row');
@@ -71,9 +82,9 @@ func (c *KoshaNoticeCrawler) FetchPosts() ([]Post, error) {
 						result.push({num: num, title: title});
 					}
 				});
-				return JSON.stringify(result);
+				return result;
 			})()
-		`, &rowsData),
+		`, &rowItems),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("[kosha] chromedp failed: %w", err)
@@ -87,40 +98,6 @@ func (c *KoshaNoticeCrawler) FetchPosts() ([]Post, error) {
 	pstMap := make(map[int]string)
 	for _, item := range baseList {
 		pstMap[item.Rnum] = item.PstNo
-	}
-
-	// Parse rowsData - it was returned as a JSON string, need to re-unmarshal
-	// chromedp.Evaluate with a string return may need special handling
-	var rowItems []struct {
-		Num   string `json:"num"`
-		Title string `json:"title"`
-	}
-
-	// The Evaluate call above returns a string (JSON.stringify result)
-	// We need to handle this as the rowsData might be a string
-	rowsJSON := ""
-	// Re-run to get rows as string
-	err = chromedp.Run(ctx,
-		chromedp.Evaluate(`
-			(() => {
-				const rows = document.querySelectorAll('.tboard_list_row');
-				const result = [];
-				rows.forEach(row => {
-					const numEl = row.querySelector("[data-tboard-artcl-no='D020100001']");
-					const titleEl = row.querySelector("a.tboard_list_subject");
-					if (numEl && titleEl) {
-						let num = numEl.textContent.trim().replace(/,/g, '').replace('No', '').trim();
-						let title = titleEl.getAttribute('title') || titleEl.textContent.trim();
-						result.push({"num": num, "title": title});
-					}
-				});
-				return result;
-			})()
-		`, &rowItems),
-	)
-	if err != nil {
-		// Fallback: try parsing the original string
-		_ = json.Unmarshal([]byte(rowsJSON), &rowItems)
 	}
 
 	var posts []Post
