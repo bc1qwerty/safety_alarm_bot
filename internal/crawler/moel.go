@@ -1,6 +1,7 @@
 package crawler
 
 import (
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net/http"
@@ -25,7 +26,15 @@ func NewMoelCrawler() *MoelCrawler {
 }
 
 func (c *MoelCrawler) FetchPosts() ([]Post, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
+	// moel.go.kr blocks Go's default HTTP/2 transport (RST during handshake).
+	// Force HTTP/1.1 by disabling h2 negotiation. curl works fine over h1.1.
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			NextProtos: []string{"http/1.1"},
+		},
+		ForceAttemptHTTP2: false,
+	}
+	client := &http.Client{Timeout: 30 * time.Second, Transport: transport}
 	req, err := http.NewRequest("GET", moelListURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("[moel] new request failed: %w", err)
