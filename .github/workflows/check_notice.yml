@@ -33,7 +33,7 @@ jobs:
       - name: Build
         run: go build -o safety-alarm-bot .
 
-      - name: Run bot
+      - name: Run bot (skip moel — runs from dell instead, see Korean IP requirement)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -41,6 +41,7 @@ jobs:
           NOTIFICATION_HUB_URL: ${{ secrets.NOTIFICATION_HUB_URL }}
           NOTIFICATION_SECRET: ${{ secrets.NOTIFICATION_SECRET }}
           BAND_KEY: ${{ secrets.BAND_KEY }}
+          SAFETY_ALARM_SKIP: moel
         run: ./safety-alarm-bot
 
       - name: Commit updated state

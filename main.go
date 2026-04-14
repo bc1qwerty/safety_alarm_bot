@@ -31,6 +31,30 @@ func formatBandMessage(posts []crawler.Post, source string) string {
 	return strings.Join(lines, "\n")
 }
 
+// shouldRun returns true when the given source should be executed in this run.
+// Controlled by SAFETY_ALARM_ONLY / SAFETY_ALARM_SKIP env vars (comma separated).
+// ONLY takes precedence over SKIP. When neither is set, all sources run.
+func shouldRun(source string) bool {
+	only := strings.TrimSpace(os.Getenv("SAFETY_ALARM_ONLY"))
+	if only != "" {
+		for _, s := range strings.Split(only, ",") {
+			if strings.TrimSpace(s) == source {
+				return true
+			}
+		}
+		return false
+	}
+	skip := strings.TrimSpace(os.Getenv("SAFETY_ALARM_SKIP"))
+	if skip != "" {
+		for _, s := range strings.Split(skip, ",") {
+			if strings.TrimSpace(s) == source {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func main() {
 	log.SetOutput(os.Stdout)
 	log.SetFlags(log.Ldate | log.Ltime)
@@ -50,17 +74,32 @@ func main() {
 	}
 
 	log.Println("=== Safety Alarm Bot started ===")
+	if only := os.Getenv("SAFETY_ALARM_ONLY"); only != "" {
+		log.Printf("Filter: ONLY=%s", only)
+	}
+	if skip := os.Getenv("SAFETY_ALARM_SKIP"); skip != "" {
+		log.Printf("Filter: SKIP=%s", skip)
+	}
 	notifyhub.LogPush("safety-alarm-bot", "info", "run started", "")
 
 	totalNew := 0
 
-	// 1) Notice crawlers (batch send)
-	noticeCrawlers := []crawler.Crawler{
-		crawler.NewMoelCrawler(),
-		crawler.NewKoshaNoticeCrawler(),
+	// 1) Notice crawlers (batch send) — filtered by shouldRun
+	type noticeEntry struct {
+		source  string
+		crawler crawler.Crawler
+	}
+	noticeCrawlers := []noticeEntry{
+		{"moel", crawler.NewMoelCrawler()},
+		{"kosha_notice", crawler.NewKoshaNoticeCrawler()},
 	}
 
-	for _, c := range noticeCrawlers {
+	for _, entry := range noticeCrawlers {
+		if !shouldRun(entry.source) {
+			log.Printf("[%s] skipped (filter)", entry.source)
+			continue
+		}
+		c := entry.crawler
 		newPosts, err := c.GetNewPosts()
 		if err != nil {
 			log.Printf("[%s] crawl error: %v", c.SiteName(), err)
@@ -93,27 +132,35 @@ func main() {
 	}
 
 	// 2) Accident crawler (individual send with image)
-	accidentCrawler := crawler.NewKoshaAccidentCrawler()
-	newAccidents, err := accidentCrawler.GetNewPosts()
-	if err != nil {
-		log.Printf("[kosha_accident] crawl error: %v", err)
-		newAccidents = nil
-	}
-
-	// Send oldest first
-	for i := len(newAccidents) - 1; i >= 0; i-- {
-		post := newAccidents[i]
-		totalNew++
-		if post.ImageData != nil {
-			notifier.TelegramSendPhoto(post.ImageData, "")
-		} else {
-			log.Printf("[kosha_accident] no image: %s", post.Title)
+	if shouldRun("kosha_accident") {
+		accidentCrawler := crawler.NewKoshaAccidentCrawler()
+		newAccidents, err := accidentCrawler.GetNewPosts()
+		if err != nil {
+			log.Printf("[kosha_accident] crawl error: %v", err)
+			newAccidents = nil
 		}
+
+		// Send oldest first
+		for i := len(newAccidents) - 1; i >= 0; i-- {
+			post := newAccidents[i]
+			totalNew++
+			if post.ImageData != nil {
+				notifier.TelegramSendPhoto(post.ImageData, "")
+			} else {
+				log.Printf("[kosha_accident] no image: %s", post.Title)
+			}
+		}
+	} else {
+		log.Printf("[kosha_accident] skipped (filter)")
 	}
 
 	// 3) Archive crawlers (OPS/booklet/video, individual send)
 	archiveTypes := []string{"ops", "booklet", "video"}
 	for _, ct := range archiveTypes {
+		if !shouldRun("kosha_archive_" + ct) {
+			log.Printf("[kosha_archive_%s] skipped (filter)", ct)
+			continue
+		}
 		c := crawler.NewKoshaArchiveCrawler(ct)
 		newPosts, err := c.GetNewPosts()
 		if err != nil {
@@ -138,6 +185,11 @@ func main() {
 	}
 
 	// 4) eBook crawler (PDF, individual send)
+	if !shouldRun("kosha_ebook") {
+		log.Printf("[kosha_ebook] skipped (filter)")
+		log.Printf("=== Done: %d new notice(s) total ===", totalNew)
+		return
+	}
 	ebookCrawler := crawler.NewKoshaEbookCrawler()
 	newEbooks, err := ebookCrawler.GetNewPosts()
 	if err != nil {
