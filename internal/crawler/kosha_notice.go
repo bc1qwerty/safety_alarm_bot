@@ -26,9 +26,14 @@ func NewKoshaNoticeCrawler() *KoshaNoticeCrawler {
 }
 
 // baseListItem represents an item from koshaTboard.bbsInfo.tboard.result.search.baseList.
+// KOSHA returns sticky notices first (each with totalCount=1) followed by regular posts
+// (totalCount=total regular count). Both groups restart rnum at 1, so we have to split
+// them by totalCount before mapping rnum → pstNo, otherwise the sticky's pstNo is
+// overwritten by the first regular post's pstNo and every regular row is off by one.
 type baseListItem struct {
-	Rnum  int    `json:"rnum"`
-	PstNo string `json:"pstNo"`
+	Rnum       int    `json:"rnum"`
+	PstNo      string `json:"pstNo"`
+	TotalCount int    `json:"totalCount"`
 }
 
 func (c *KoshaNoticeCrawler) FetchPosts() ([]Post, error) {
@@ -95,19 +100,33 @@ func (c *KoshaNoticeCrawler) FetchPosts() ([]Post, error) {
 	if err := json.Unmarshal([]byte(baseListJSON), &baseList); err != nil {
 		return nil, fmt.Errorf("[kosha] baseList parse failed: %w", err)
 	}
+	// KOSHA returns sticky notices first (each with totalCount=1) followed by
+	// regular posts (totalCount=total regular count). Both groups restart rnum at 1,
+	// so we keep only the largest-totalCount group when mapping rnum → pstNo.
+	// Otherwise the sticky's pstNo gets overwritten and every regular row is off by one.
+	mainTotal := 0
+	for _, item := range baseList {
+		if item.TotalCount > mainTotal {
+			mainTotal = item.TotalCount
+		}
+	}
 	pstMap := make(map[int]string)
 	for _, item := range baseList {
-		pstMap[item.Rnum] = item.PstNo
+		if item.TotalCount == mainTotal {
+			pstMap[item.Rnum] = item.PstNo
+		}
 	}
 
 	var posts []Post
-	for idx, row := range rowItems {
+	regularIdx := 0
+	for _, row := range rowItems {
 		numText := strings.TrimSpace(row.Num)
 		if !isDigits(numText) {
 			continue
 		}
+		regularIdx++
 
-		pstNo := pstMap[idx+1]
+		pstNo := pstMap[regularIdx]
 		url := koshaBoardURL
 		if pstNo != "" {
 			url = koshaDetailURL + pstNo
