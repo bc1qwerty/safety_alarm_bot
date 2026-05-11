@@ -28,6 +28,10 @@ func NewMoelCrawler() *MoelCrawler {
 func (c *MoelCrawler) FetchPosts() ([]Post, error) {
 	// moel.go.kr blocks Go's default HTTP/2 transport (RST during handshake).
 	// Force HTTP/1.1 by disabling h2 negotiation. curl works fine over h1.1.
+	// Even with h1.1, the first connection often gets reset (observed from
+	// dell on 2026-05-11: attempt 1 "read: connection reset by peer", attempt
+	// 2 succeeded). Retry 3x with backoff so a flaky handshake doesn't make
+	// the bot skip a whole cycle.
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			NextProtos: []string{"http/1.1"},
@@ -35,28 +39,48 @@ func (c *MoelCrawler) FetchPosts() ([]Post, error) {
 		ForceAttemptHTTP2: false,
 	}
 	client := &http.Client{Timeout: 30 * time.Second, Transport: transport}
-	req, err := http.NewRequest("GET", moelListURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("[moel] new request failed: %w", err)
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "ko-KR,ko;q=0.9,en;q=0.8")
-	req.Header.Set("Referer", moelBaseURL+"/news/notice/")
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("[moel] request failed: %w", err)
-	}
-	defer resp.Body.Close()
+	var doc *goquery.Document
+	const maxAttempts = 3
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		req, err := http.NewRequest("GET", moelListURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("[moel] new request failed: %w", err)
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+		req.Header.Set("Accept-Language", "ko-KR,ko;q=0.9,en;q=0.8")
+		req.Header.Set("Referer", moelBaseURL+"/news/notice/")
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("[moel] HTTP %d", resp.StatusCode)
-	}
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("[moel] request failed (attempt %d/%d): %v", attempt, maxAttempts, err)
+			if attempt < maxAttempts {
+				time.Sleep(time.Duration(attempt) * 2 * time.Second)
+				continue
+			}
+			return nil, fmt.Errorf("[moel] request failed after %d attempts: %w", maxAttempts, err)
+		}
 
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("[moel] parse failed: %w", err)
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			if attempt < maxAttempts && resp.StatusCode >= 500 {
+				log.Printf("[moel] HTTP %d (attempt %d/%d) — retrying", resp.StatusCode, attempt, maxAttempts)
+				time.Sleep(time.Duration(attempt) * 2 * time.Second)
+				continue
+			}
+			return nil, fmt.Errorf("[moel] HTTP %d", resp.StatusCode)
+		}
+
+		doc, err = goquery.NewDocumentFromReader(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("[moel] parse failed: %w", err)
+		}
+		break
+	}
+	if doc == nil {
+		return nil, fmt.Errorf("[moel] request failed: no document after retries")
 	}
 
 	var posts []Post
