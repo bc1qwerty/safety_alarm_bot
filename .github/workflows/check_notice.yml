@@ -30,6 +30,14 @@ jobs:
         with:
           chrome-version: stable
 
+      # Run unit tests before producing a binary. Locks in the kosha_notice
+      # pairing invariants (no sticky / 1 sticky / N stickies / invariant
+      # break must drop the row) so the title<->URL off-by-one bug cannot
+      # silently regress on a future refactor. If tests fail, the bot does
+      # NOT run, so no wrong-URL notifications can go out.
+      - name: Test
+        run: go test ./...
+
       - name: Build
         run: go build -o safety-alarm-bot .
 
