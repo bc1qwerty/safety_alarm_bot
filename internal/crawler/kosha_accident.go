@@ -17,6 +17,12 @@ import (
 const (
 	accidentListURL = "https://portal.kosha.or.kr/archive/imprtnDsstrAlrame/CSADV50000/CSADV50000M01"
 	apiKeyword      = "selectImprtnDsstrSirnList"
+	// accidentAPIWait is how long we'll wait for the API call to finish loading
+	// after the page navigates. Replaces the previous fixed chromedp.Sleep(2s)
+	// which raced the network -- if the response took longer than 2s, the
+	// requestID was never captured and the crawler reported "API response not
+	// captured". Now we wait on an actual EventLoadingFinished signal.
+	accidentAPIWait = 20 * time.Second
 )
 
 // KoshaAccidentCrawler crawls 중대재해 사이렌 using chromedp + CDP network capture.
@@ -34,7 +40,7 @@ type accidentAPIResponse struct {
 		ImprtnDsstrSirnList []struct {
 			ImprtnDsstrSirnNo int    `json:"imprtnDsstrSirnNo"`
 			ImprtnDsstrSirnNm string `json:"imprtnDsstrSirnNm"`
-			ImgSrc             string `json:"imgSrc"`
+			ImgSrc            string `json:"imgSrc"`
 		} `json:"imprtnDsstrSirnList"`
 	} `json:"payload"`
 }
@@ -62,62 +68,66 @@ func (c *KoshaAccidentCrawler) FetchPosts() ([]Post, error) {
 	ctx, cancel := chromedp.NewContext(allocCtx)
 	defer cancel()
 
-	ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel = context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 
-	// Capture network responses
-	var mu sync.Mutex
-	var capturedBody string
-	var capturedRequestID network.RequestID
+	// Track every request whose URL contains apiKeyword (in case the page
+	// fires more than one). Signal respDone the moment any of them finishes
+	// loading -- that request ID is the one we'll fetch the body from.
+	var pendingMu sync.Mutex
+	pending := make(map[network.RequestID]bool)
+	respDone := make(chan network.RequestID, 1)
 
-	// Enable network events and listen for the API response
 	chromedp.ListenTarget(ctx, func(ev interface{}) {
 		switch e := ev.(type) {
 		case *network.EventResponseReceived:
 			if strings.Contains(e.Response.URL, apiKeyword) {
-				mu.Lock()
-				capturedRequestID = e.RequestID
-				mu.Unlock()
+				pendingMu.Lock()
+				pending[e.RequestID] = true
+				pendingMu.Unlock()
 			}
 		case *network.EventLoadingFinished:
-			mu.Lock()
-			rid := capturedRequestID
-			mu.Unlock()
-			if rid != "" && e.RequestID == rid {
-				// We'll fetch the body after navigation completes
+			pendingMu.Lock()
+			matched := pending[e.RequestID]
+			if matched {
+				delete(pending, e.RequestID)
+			}
+			pendingMu.Unlock()
+			if matched {
+				select {
+				case respDone <- e.RequestID:
+				default:
+				}
 			}
 		}
 	})
 
-	// Navigate and wait for content
-	err := chromedp.Run(ctx,
+	if err := chromedp.Run(ctx,
 		network.Enable(),
 		chromedp.Navigate(accidentListURL),
-		chromedp.WaitVisible("a.subject", chromedp.ByQuery),
-		chromedp.Sleep(2*time.Second), // Allow network responses to complete
-	)
-	if err != nil {
-		return nil, fmt.Errorf("[kosha_accident] chromedp failed: %w", err)
+	); err != nil {
+		return nil, fmt.Errorf("[kosha_accident] navigate failed: %w", err)
 	}
 
-	// Get the captured request body
-	mu.Lock()
-	rid := capturedRequestID
-	mu.Unlock()
-
-	if rid == "" {
-		return nil, fmt.Errorf("[kosha_accident] API response not captured")
+	// Wait for the API response to finish loading.
+	var capturedRequestID network.RequestID
+	select {
+	case capturedRequestID = <-respDone:
+	case <-time.After(accidentAPIWait):
+		return nil, fmt.Errorf("[kosha_accident] timed out (%s) waiting for %s response", accidentAPIWait, apiKeyword)
+	case <-ctx.Done():
+		return nil, fmt.Errorf("[kosha_accident] context cancelled while waiting for API: %w", ctx.Err())
 	}
 
-	err = chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		body, err := network.GetResponseBody(rid).Do(ctx)
+	var capturedBody string
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		body, err := network.GetResponseBody(capturedRequestID).Do(ctx)
 		if err != nil {
 			return err
 		}
 		capturedBody = string(body)
 		return nil
-	}))
-	if err != nil {
+	})); err != nil {
 		return nil, fmt.Errorf("[kosha_accident] get response body failed: %w", err)
 	}
 
@@ -157,7 +167,7 @@ func (c *KoshaAccidentCrawler) FetchPosts() ([]Post, error) {
 			PostID:    no,
 			Title:     title,
 			URL:       accidentListURL,
-			Source:     "\uC911\uB300\uC7AC\uD574 \uC0AC\uC774\uB80C", // 중대재해 사이렌
+			Source:    "중대재해 사이렌", // 중대재해 사이렌
 			ImageData: imgBytes,
 		})
 	}

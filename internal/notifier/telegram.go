@@ -13,8 +13,85 @@ import (
 	"github.com/bc1qwerty/safety-alarm-bot/internal/config"
 )
 
+// tgRetryMax is the number of total attempts (1 + retries). Increase only if
+// the underlying call is idempotent on the Telegram side -- sendMessage,
+// sendPhoto and sendDocument are.
+const tgRetryMax = 3
+
 func tgAPIURL(method string) string {
 	return fmt.Sprintf("https://api.telegram.org/bot%s/%s", config.TelegramBotToken, method)
+}
+
+// tgPost POSTs to the Telegram bot API with retries on 429 (Too Many Requests,
+// honouring parameters.retry_after) and 5xx. 4xx other than 429 are treated as
+// permanent errors and returned immediately so we don't burn the rate budget
+// on malformed payloads. Body must be a fresh buffer per call because the
+// retry path re-issues bytes.NewReader on it.
+//
+// kind is a short label for logs (e.g. "message", "photo", "document").
+func tgPost(method, contentType string, body []byte, kind string) bool {
+	client := &http.Client{Timeout: 60 * time.Second}
+
+	for attempt := 1; attempt <= tgRetryMax; attempt++ {
+		resp, err := client.Post(tgAPIURL(method), contentType, bytes.NewReader(body))
+		if err != nil {
+			log.Printf("[telegram] %s transport error (attempt %d/%d): %v", kind, attempt, tgRetryMax, err)
+			if attempt < tgRetryMax {
+				time.Sleep(time.Duration(attempt*2) * time.Second)
+				continue
+			}
+			return false
+		}
+
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		switch {
+		case resp.StatusCode == http.StatusOK:
+			log.Printf("[telegram] %s sent (attempt %d)", kind, attempt)
+			return true
+		case resp.StatusCode == http.StatusTooManyRequests:
+			wait := parseRetryAfter(respBody)
+			log.Printf("[telegram] %s rate limited, sleeping %ds (attempt %d/%d)", kind, wait, attempt, tgRetryMax)
+			if attempt < tgRetryMax {
+				time.Sleep(time.Duration(wait) * time.Second)
+				continue
+			}
+		case resp.StatusCode >= 500:
+			log.Printf("[telegram] %s HTTP %d (attempt %d/%d): %s", kind, resp.StatusCode, attempt, tgRetryMax, string(respBody))
+			if attempt < tgRetryMax {
+				time.Sleep(time.Duration(attempt*2) * time.Second)
+				continue
+			}
+		default:
+			// 4xx other than 429: malformed request, no point retrying.
+			log.Printf("[telegram] %s HTTP %d (permanent): %s", kind, resp.StatusCode, string(respBody))
+			return false
+		}
+	}
+	log.Printf("[telegram] %s failed after %d attempts", kind, tgRetryMax)
+	return false
+}
+
+// parseRetryAfter pulls parameters.retry_after out of a Telegram 429 body and
+// clamps it to [1, 60] seconds. Telegram sometimes reports very large values
+// (intentional cooldowns); we cap so a single rate-limit burst does not stall
+// the whole bot run.
+func parseRetryAfter(body []byte) int {
+	var r struct {
+		Parameters struct {
+			RetryAfter int `json:"retry_after"`
+		} `json:"parameters"`
+	}
+	_ = json.Unmarshal(body, &r)
+	w := r.Parameters.RetryAfter
+	if w < 1 {
+		w = 5
+	}
+	if w > 60 {
+		w = 60
+	}
+	return w
 }
 
 // TelegramSendMessage sends a text message via Telegram Bot API.
@@ -31,23 +108,7 @@ func TelegramSendMessage(text string) bool {
 		"disable_web_page_preview": true,
 	}
 	body, _ := json.Marshal(payload)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Post(tgAPIURL("sendMessage"), "application/json", bytes.NewReader(body))
-	if err != nil {
-		log.Printf("[telegram] send failed: %v", err)
-		return false
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		log.Printf("[telegram] send failed: HTTP %d: %s", resp.StatusCode, string(respBody))
-		return false
-	}
-
-	log.Println("[telegram] message sent")
-	return true
+	return tgPost("sendMessage", "application/json", body, "message")
 }
 
 // TelegramSendDocument sends a file via Telegram Bot API (sendDocument).
@@ -57,41 +118,15 @@ func TelegramSendDocument(docBytes []byte, filename string, caption string) bool
 		return false
 	}
 
-	var buf bytes.Buffer
-	w := multipart.NewWriter(&buf)
-
-	_ = w.WriteField("chat_id", config.TelegramChatID)
-	if caption != "" {
-		_ = w.WriteField("caption", caption)
-	}
-
-	part, err := w.CreateFormFile("document", filename)
+	body, contentType, err := buildMultipart(map[string]string{
+		"chat_id": config.TelegramChatID,
+		"caption": caption,
+	}, "document", filename, docBytes)
 	if err != nil {
-		log.Printf("[telegram] create form file failed: %v", err)
+		log.Printf("[telegram] document build failed: %v", err)
 		return false
 	}
-	if _, err := part.Write(docBytes); err != nil {
-		log.Printf("[telegram] write form file failed: %v", err)
-		return false
-	}
-	w.Close()
-
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Post(tgAPIURL("sendDocument"), w.FormDataContentType(), &buf)
-	if err != nil {
-		log.Printf("[telegram] document send failed: %v", err)
-		return false
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		log.Printf("[telegram] document send failed: HTTP %d: %s", resp.StatusCode, string(respBody))
-		return false
-	}
-
-	log.Printf("[telegram] document sent: %s", filename)
-	return true
+	return tgPost("sendDocument", contentType, body, "document:"+filename)
 }
 
 // TelegramSendPhoto sends an image as a document (uncompressed) via Telegram Bot API.
@@ -101,40 +136,43 @@ func TelegramSendPhoto(photoBytes []byte, caption string) bool {
 		return false
 	}
 
+	fields := map[string]string{
+		"chat_id": config.TelegramChatID,
+		"caption": caption,
+	}
+	if caption != "" {
+		fields["parse_mode"] = "HTML"
+	}
+	body, contentType, err := buildMultipart(fields, "document", "image.jpg", photoBytes)
+	if err != nil {
+		log.Printf("[telegram] photo build failed: %v", err)
+		return false
+	}
+	return tgPost("sendDocument", contentType, body, "photo")
+}
+
+// buildMultipart returns the request body + content-type for a multipart
+// upload. We materialize the whole body as []byte so retries can re-read it.
+func buildMultipart(fields map[string]string, fileField, filename string, fileBytes []byte) ([]byte, string, error) {
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
-
-	_ = w.WriteField("chat_id", config.TelegramChatID)
-	if caption != "" {
-		_ = w.WriteField("caption", caption)
-		_ = w.WriteField("parse_mode", "HTML")
+	for k, v := range fields {
+		if v == "" {
+			continue
+		}
+		if err := w.WriteField(k, v); err != nil {
+			return nil, "", err
+		}
 	}
-
-	part, err := w.CreateFormFile("document", "image.jpg")
+	part, err := w.CreateFormFile(fileField, filename)
 	if err != nil {
-		log.Printf("[telegram] create form file failed: %v", err)
-		return false
+		return nil, "", err
 	}
-	if _, err := part.Write(photoBytes); err != nil {
-		log.Printf("[telegram] write form file failed: %v", err)
-		return false
+	if _, err := part.Write(fileBytes); err != nil {
+		return nil, "", err
 	}
-	w.Close()
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Post(tgAPIURL("sendDocument"), w.FormDataContentType(), &buf)
-	if err != nil {
-		log.Printf("[telegram] photo send failed: %v", err)
-		return false
+	if err := w.Close(); err != nil {
+		return nil, "", err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		log.Printf("[telegram] photo send failed: HTTP %d: %s", resp.StatusCode, string(respBody))
-		return false
-	}
-
-	log.Println("[telegram] photo sent (uncompressed)")
-	return true
+	return buf.Bytes(), w.FormDataContentType(), nil
 }

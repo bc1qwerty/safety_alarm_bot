@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"html"
 	"log"
 	"os"
 	"path/filepath"
@@ -13,20 +14,24 @@ import (
 	"github.com/bc1qwerty/safety-alarm-bot/internal/notifyhub"
 )
 
+// formatMessage builds the HTML-mode Telegram batch text. Telegram parses
+// the body as HTML when parse_mode=HTML, so every user-controlled string
+// (source, title, URL) MUST be escaped or a stray '<', '>' or '&' in a
+// title aborts the send with a 400 from Telegram.
 func formatMessage(posts []crawler.Post, source string) string {
 	var lines []string
-	lines = append(lines, fmt.Sprintf("\U0001f4e2 [%s] \uc0c8 \uacf5\uc9c0\uc0ac\ud56d %d\uac74\n", source, len(posts)))
+	lines = append(lines, fmt.Sprintf("\U0001f4e2 [%s] 새 공지사항 %d건\n", html.EscapeString(source), len(posts)))
 	for _, p := range posts {
-		lines = append(lines, fmt.Sprintf("\u2022 <a href=\"%s\">%s</a>", p.URL, p.Title))
+		lines = append(lines, fmt.Sprintf("• <a href=\"%s\">%s</a>", html.EscapeString(p.URL), html.EscapeString(p.Title)))
 	}
 	return strings.Join(lines, "\n")
 }
 
 func formatBandMessage(posts []crawler.Post, source string) string {
 	var lines []string
-	lines = append(lines, fmt.Sprintf("[%s] \uc0c8 \uacf5\uc9c0\uc0ac\ud56d %d\uac74\n", source, len(posts)))
+	lines = append(lines, fmt.Sprintf("[%s] 새 공지사항 %d건\n", source, len(posts)))
 	for _, p := range posts {
-		lines = append(lines, fmt.Sprintf("\u2022 %s\n  %s", p.Title, p.URL))
+		lines = append(lines, fmt.Sprintf("• %s\n  %s", p.Title, p.URL))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -84,6 +89,14 @@ func main() {
 
 	totalNew := 0
 
+	// State advancement policy:
+	//
+	// FilterNewPosts no longer auto-saves lastID. State only advances after
+	// a successful Telegram delivery. This means a transient Telegram outage
+	// turns into a re-send next run (acceptable duplicates) instead of
+	// permanent silence on those posts. Band is best-effort and does not
+	// gate state. notifyhub is also best-effort.
+
 	// 1) Notice crawlers (batch send) — filtered by shouldRun
 	type noticeEntry struct {
 		source  string
@@ -112,12 +125,12 @@ func main() {
 		totalNew += len(newPosts)
 
 		tgMsg := formatMessage(newPosts, newPosts[0].Source)
-		notifier.TelegramSendMessage(tgMsg)
+		tgOk := notifier.TelegramSendMessage(tgMsg)
 
 		bandMsg := formatBandMessage(newPosts, newPosts[0].Source)
-		notifier.BandSendPost(bandMsg)
+		notifier.BandSendPost(bandMsg) // best effort, does not gate state
 
-		// Push each notice to hub individually
+		// Push each notice to hub individually (best effort)
 		for _, p := range newPosts {
 			if err := notifyhub.Push(notifyhub.Payload{
 				ChannelID: "safety-alarm",
@@ -128,6 +141,13 @@ func main() {
 			}); err != nil {
 				log.Printf("hub push error: %v", err)
 			}
+		}
+
+		if tgOk {
+			// newPosts is newest-first; advance cursor to the newest post.
+			crawler.SaveLastID(c.SiteName(), newPosts[0].PostID)
+		} else {
+			log.Printf("[%s] Telegram send failed; state NOT advanced — batch will retry next run", c.SiteName())
 		}
 	}
 
@@ -140,15 +160,21 @@ func main() {
 			newAccidents = nil
 		}
 
-		// Send oldest first
+		// Send oldest first; advance state per success, stop at first failure.
 		for i := len(newAccidents) - 1; i >= 0; i-- {
 			post := newAccidents[i]
 			totalNew++
+			sent := true
 			if post.ImageData != nil {
-				notifier.TelegramSendPhoto(post.ImageData, "")
+				sent = notifier.TelegramSendPhoto(post.ImageData, "")
 			} else {
-				log.Printf("[kosha_accident] no image: %s", post.Title)
+				log.Printf("[kosha_accident] no image: %s -- skipping but advancing state", post.Title)
 			}
+			if !sent {
+				log.Printf("[kosha_accident] Telegram failed for #%s; batch stopped, will retry next run", post.PostID)
+				break
+			}
+			crawler.SaveLastID("kosha_accident", post.PostID)
 		}
 	} else {
 		log.Printf("[kosha_accident] skipped (filter)")
@@ -168,19 +194,26 @@ func main() {
 			continue
 		}
 
-		// Send oldest first
+		// Send oldest first; advance state per success, stop at first failure.
 		for i := len(newPosts) - 1; i >= 0; i-- {
 			post := newPosts[i]
 			totalNew++
+			var sent bool
 			if post.ImageData != nil {
-				notifier.TelegramSendPhoto(post.ImageData, post.Title)
+				sent = notifier.TelegramSendPhoto(post.ImageData, post.Title)
 			} else if post.FileData != nil && post.FileName != "" {
-				notifier.TelegramSendDocument(post.FileData, post.FileName, post.Title)
+				sent = notifier.TelegramSendDocument(post.FileData, post.FileName, post.Title)
 			} else {
-				// Text message for items without files (e.g., video links)
+				// Text message for items without files (e.g., video links).
+				// Plain text mode -- no HTML escape needed.
 				msg := fmt.Sprintf("\U0001f4f9 [%s]\n%s\n%s", post.Source, post.Title, post.URL)
-				notifier.TelegramSendMessage(msg)
+				sent = notifier.TelegramSendMessage(msg)
 			}
+			if !sent {
+				log.Printf("[%s] Telegram failed for #%s; batch stopped, will retry next run", c.SiteName(), post.PostID)
+				break
+			}
+			crawler.SaveLastID(c.SiteName(), post.PostID)
 		}
 	}
 
@@ -197,22 +230,30 @@ func main() {
 		newEbooks = nil
 	}
 
-	// Send oldest first
+	// Send oldest first; advance state per success, stop at first failure.
 	for i := len(newEbooks) - 1; i >= 0; i-- {
 		post := newEbooks[i]
 		totalNew++
+		var sent bool
 		if post.FileData != nil && post.FileName != "" {
-			notifier.TelegramSendDocument(post.FileData, post.FileName, post.Title)
+			sent = notifier.TelegramSendDocument(post.FileData, post.FileName, post.Title)
 		} else {
-			// eBook viewer link + PDF download links
+			// eBook viewer link + PDF download links. HTML-escape user content
+			// because parse_mode=HTML is set.
 			var lines []string
-			lines = append(lines, fmt.Sprintf("\U0001f4d6 [%s] %s\n", post.Source, post.Title))
-			lines = append(lines, fmt.Sprintf("\U0001f4d6 e-Book \ubcf4\uae30\n%s", post.URL))
+			lines = append(lines, fmt.Sprintf("\U0001f4d6 [%s] %s\n", html.EscapeString(post.Source), html.EscapeString(post.Title)))
+			lines = append(lines, fmt.Sprintf("\U0001f4d6 e-Book 보기\n%s", html.EscapeString(post.URL)))
 			for _, dl := range post.DownloadURLs {
-				lines = append(lines, fmt.Sprintf("\U0001f4e5 <a href=\"%s\">[\ub2e4\uc6b4\ub85c\ub4dc] %s</a>", dl.URL, dl.Label))
+				lines = append(lines, fmt.Sprintf("\U0001f4e5 <a href=\"%s\">[다운로드] %s</a>",
+					html.EscapeString(dl.URL), html.EscapeString(dl.Label)))
 			}
-			notifier.TelegramSendMessage(strings.Join(lines, "\n"))
+			sent = notifier.TelegramSendMessage(strings.Join(lines, "\n"))
 		}
+		if !sent {
+			log.Printf("[kosha_ebook] Telegram failed for #%s; batch stopped, will retry next run", post.PostID)
+			break
+		}
+		crawler.SaveLastID("kosha_ebook", post.PostID)
 	}
 
 	log.Printf("=== Done: %d new notice(s) total ===", totalNew)

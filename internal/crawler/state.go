@@ -45,9 +45,18 @@ func SaveLastID(siteName, postID string) {
 	}
 }
 
-// FilterNewPosts returns posts newer than the last saved ID and updates state.
-// Posts are expected in newest-first order. It stops at the first post whose
-// ID is <= lastID (numeric comparison).
+// FilterNewPosts returns posts newer than the last saved ID. It does NOT
+// advance state: callers must invoke SaveLastID themselves once the post has
+// been delivered to its notification channel.
+//
+// Coupling state advancement to delivery (instead of crawl) prevents the
+// failure mode where a Telegram/Band outage permanently loses notifications,
+// because state used to advance immediately at crawl time regardless of
+// whether the message ever reached a channel. With this split, a failed
+// send simply re-enters the new-posts queue on the next run.
+//
+// Posts are expected in newest-first order. Iteration stops at the first post
+// whose ID is <= lastID (numeric comparison).
 func FilterNewPosts(siteName string, posts []Post) []Post {
 	lastID := LoadLastID(siteName)
 
@@ -64,7 +73,6 @@ func FilterNewPosts(siteName string, posts []Post) []Post {
 	}
 
 	if len(newPosts) > 0 {
-		SaveLastID(siteName, newPosts[0].PostID)
 		log.Printf("[%s] %d new post(s) found", siteName, len(newPosts))
 	} else {
 		log.Printf("[%s] no new posts", siteName)
