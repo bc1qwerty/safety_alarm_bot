@@ -168,6 +168,10 @@ func main() {
 		OnError: func(err error) {
 			_ = notifyhub.LogPush("safety-alarm-bot", "error", err.Error(), "")
 		},
+		OnPollComplete: func(ctx context.Context, n int) error {
+			return notifyhub.LogPush("safety-alarm-bot", "info",
+				fmt.Sprintf("poll complete (%d items)", n), "")
+		},
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
