@@ -24,6 +24,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # go.mod uses `replace ../txid-bot-framework` (local dev convention).
+      # Check the framework out as a sibling so the GHA build resolves it.
+      - name: Checkout framework
+        uses: actions/checkout@v4
+        with:
+          repository: bc1qwerty/txid-bot-framework
+          path: txid-bot-framework-checkout
+          ref: main
+
+      - name: Stage framework sibling
+        run: mv txid-bot-framework-checkout ../txid-bot-framework
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
