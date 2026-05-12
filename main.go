@@ -148,6 +148,7 @@ func main() {
 		ArchiveDir:      archiveDir(projectRoot),
 		HeartbeatDir:    heartbeatDir(),
 		MaxItemsPerPoll: maxSendPerRun,
+		BootstrapMode:   os.Getenv("BOOTSTRAP_DEDUP") == "1",
 		OnNewItem: func(ctx context.Context, item core.Item) error {
 			return notifyhub.Push(notifyhub.Payload{
 				ChannelID: config.TelegramChatID,
