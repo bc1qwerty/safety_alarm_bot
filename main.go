@@ -38,6 +38,13 @@ func (f *SafetyFormatter) Format(item core.Item) core.Message {
 	plain := fmt.Sprintf("[%s] 새 공지사항\n\n• %s\n  %s",
 		item.Category, item.Title, item.URL)
 
+	// Optional decision-aid: prepend a one-line AI take on whether this
+	// notice affects the user's projects. Best-effort, no failure.
+	if ai := source.AnalyzeNotice(item); ai != "" {
+		htmlText = "🤖 " + html.EscapeString(ai) + "\n\n" + htmlText
+		plain = "🤖 " + ai + "\n\n" + plain
+	}
+
 	return core.Message{
 		Text:      htmlText,
 		PlainText: plain,
