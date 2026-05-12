@@ -8,3 +8,4 @@ safety-alarm-bot
 
 # OMC plugin state
 .omc/
+data/archive/
