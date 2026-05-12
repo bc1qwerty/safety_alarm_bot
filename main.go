@@ -1,58 +1,65 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"html"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/bc1qwerty/safety-alarm-bot/internal/config"
 	"github.com/bc1qwerty/safety-alarm-bot/internal/crawler"
-	"github.com/bc1qwerty/safety-alarm-bot/internal/notifier"
 	"github.com/bc1qwerty/safety-alarm-bot/internal/notifyhub"
+	"github.com/bc1qwerty/safety-alarm-bot/internal/source"
+	"github.com/bc1qwerty/txid-bot-framework/pkg/bot"
+	"github.com/bc1qwerty/txid-bot-framework/pkg/core"
+	"github.com/bc1qwerty/txid-bot-framework/pkg/notify"
+	"github.com/bc1qwerty/txid-bot-framework/pkg/store"
 )
 
-// formatMessage builds the HTML-mode Telegram batch text. Telegram parses
-// the body as HTML when parse_mode=HTML, so every user-controlled string
-// (source, title, URL) MUST be escaped or a stray '<', '>' or '&' in a
-// title aborts the send with a 400 from Telegram.
-func formatMessage(posts []crawler.Post, source string) string {
-	var lines []string
-	lines = append(lines, fmt.Sprintf("\U0001f4e2 [%s] 새 공지사항 %d건\n", html.EscapeString(source), len(posts)))
-	for _, p := range posts {
-		lines = append(lines, fmt.Sprintf("• <a href=\"%s\">%s</a>", html.EscapeString(p.URL), html.EscapeString(p.Title)))
+const (
+	runTimeout      = 5 * time.Minute
+	maxSendPerRun   = 10
+)
+
+// SafetyFormatter renders a safety notice as Telegram HTML and provides
+// a plain-text variant for channels (Naver Band) that cannot parse HTML.
+type SafetyFormatter struct{}
+
+func (f *SafetyFormatter) Format(item core.Item) core.Message {
+	htmlText := fmt.Sprintf("📢 <b>[%s]</b> 새 공지사항\n\n• <a href=\"%s\">%s</a>",
+		html.EscapeString(item.Category),
+		html.EscapeString(item.URL),
+		html.EscapeString(item.Title))
+
+	plain := fmt.Sprintf("[%s] 새 공지사항\n\n• %s\n  %s",
+		item.Category, item.Title, item.URL)
+
+	return core.Message{
+		Text:      htmlText,
+		PlainText: plain,
+		ParseMode: "HTML",
 	}
-	return strings.Join(lines, "\n")
 }
 
-func formatBandMessage(posts []crawler.Post, source string) string {
-	var lines []string
-	lines = append(lines, fmt.Sprintf("[%s] 새 공지사항 %d건\n", source, len(posts)))
-	for _, p := range posts {
-		lines = append(lines, fmt.Sprintf("• %s\n  %s", p.Title, p.URL))
-	}
-	return strings.Join(lines, "\n")
-}
-
-// shouldRun returns true when the given source should be executed in this run.
-// Controlled by SAFETY_ALARM_ONLY / SAFETY_ALARM_SKIP env vars (comma separated).
-// ONLY takes precedence over SKIP. When neither is set, all sources run.
-func shouldRun(source string) bool {
-	only := strings.TrimSpace(os.Getenv("SAFETY_ALARM_ONLY"))
-	if only != "" {
+// shouldRun applies the SAFETY_ALARM_ONLY / SAFETY_ALARM_SKIP env policy
+// so operators can disable a flaky source or pin a deploy to a single
+// crawler without redeploying. ONLY takes precedence over SKIP.
+func shouldRun(name string) bool {
+	if only := strings.TrimSpace(os.Getenv("SAFETY_ALARM_ONLY")); only != "" {
 		for _, s := range strings.Split(only, ",") {
-			if strings.TrimSpace(s) == source {
+			if strings.TrimSpace(s) == name {
 				return true
 			}
 		}
 		return false
 	}
-	skip := strings.TrimSpace(os.Getenv("SAFETY_ALARM_SKIP"))
-	if skip != "" {
+	if skip := strings.TrimSpace(os.Getenv("SAFETY_ALARM_SKIP")); skip != "" {
 		for _, s := range strings.Split(skip, ",") {
-			if strings.TrimSpace(s) == source {
+			if strings.TrimSpace(s) == name {
 				return false
 			}
 		}
@@ -61,200 +68,135 @@ func shouldRun(source string) bool {
 }
 
 func main() {
-	log.SetOutput(os.Stdout)
 	log.SetFlags(log.Ldate | log.Ltime)
+	log.Println("=== Safety Alarm Bot (Framework Mode) starting ===")
+	_ = notifyhub.LogPush("safety-alarm-bot", "info", "run started", "")
 
-	// Determine project root from executable location or working directory
-	exe, err := os.Executable()
-	if err == nil {
-		projectRoot := filepath.Dir(exe)
-		// Check if data dir exists relative to executable
-		if _, err := os.Stat(filepath.Join(projectRoot, "data")); err != nil {
-			// Fall back to working directory
-			projectRoot, _ = os.Getwd()
-		}
-		config.InitWithRoot(projectRoot)
-	} else {
-		config.Init()
-	}
+	projectRoot := resolveProjectRoot()
+	config.InitWithRoot(projectRoot)
 
-	log.Println("=== Safety Alarm Bot started ===")
 	if only := os.Getenv("SAFETY_ALARM_ONLY"); only != "" {
 		log.Printf("Filter: ONLY=%s", only)
 	}
 	if skip := os.Getenv("SAFETY_ALARM_SKIP"); skip != "" {
 		log.Printf("Filter: SKIP=%s", skip)
 	}
-	notifyhub.LogPush("safety-alarm-bot", "info", "run started", "")
 
-	totalNew := 0
-
-	// State advancement policy:
-	//
-	// FilterNewPosts no longer auto-saves lastID. State only advances after
-	// a successful Telegram delivery. This means a transient Telegram outage
-	// turns into a re-send next run (acceptable duplicates) instead of
-	// permanent silence on those posts. Band is best-effort and does not
-	// gate state. notifyhub is also best-effort.
-
-	// 1) Notice crawlers (batch send) — filtered by shouldRun
-	type noticeEntry struct {
-		source  string
-		crawler crawler.Crawler
+	// Apply ONLY/SKIP filter to the crawler list before adapting.
+	allCrawlers := []crawler.Crawler{
+		crawler.NewKoshaNoticeCrawler(),
+		crawler.NewKoshaAccidentCrawler(),
+		crawler.NewKoshaArchiveCrawler("ops"),
+		crawler.NewKoshaArchiveCrawler("video"),
+		crawler.NewKoshaArchiveCrawler("booklet"),
+		crawler.NewKoshaEbookCrawler(),
+		crawler.NewMoelCrawler(),
 	}
-	noticeCrawlers := []noticeEntry{
-		{"moel", crawler.NewMoelCrawler()},
-		{"kosha_notice", crawler.NewKoshaNoticeCrawler()},
-	}
-
-	for _, entry := range noticeCrawlers {
-		if !shouldRun(entry.source) {
-			log.Printf("[%s] skipped (filter)", entry.source)
+	var crawlers []crawler.Crawler
+	for _, c := range allCrawlers {
+		if shouldRun(c.SiteName()) {
+			crawlers = append(crawlers, c)
 			continue
 		}
-		c := entry.crawler
-		newPosts, err := c.GetNewPosts()
-		if err != nil {
-			log.Printf("[%s] crawl error: %v", c.SiteName(), err)
-			continue
-		}
-		if len(newPosts) == 0 {
-			continue
-		}
-
-		totalNew += len(newPosts)
-
-		tgMsg := formatMessage(newPosts, newPosts[0].Source)
-		tgOk := notifier.TelegramSendMessage(tgMsg)
-
-		bandMsg := formatBandMessage(newPosts, newPosts[0].Source)
-		notifier.BandSendPost(bandMsg) // best effort, does not gate state
-
-		// Push each notice to hub individually (best effort)
-		for _, p := range newPosts {
-			if err := notifyhub.Push(notifyhub.Payload{
-				ChannelID: "safety-alarm",
-				Title:     p.Title,
-				Body:      p.Source,
-				URL:       p.URL,
-				Category:  p.Source,
-			}); err != nil {
-				log.Printf("hub push error: %v", err)
-			}
-		}
-
-		if tgOk {
-			// newPosts is newest-first; advance cursor to the newest post.
-			crawler.SaveLastID(c.SiteName(), newPosts[0].PostID)
-		} else {
-			log.Printf("[%s] Telegram send failed; state NOT advanced — batch will retry next run", c.SiteName())
-		}
+		log.Printf("skipping crawler: %s", c.SiteName())
 	}
-
-	// 2) Accident crawler (individual send with image)
-	if shouldRun("kosha_accident") {
-		accidentCrawler := crawler.NewKoshaAccidentCrawler()
-		newAccidents, err := accidentCrawler.GetNewPosts()
-		if err != nil {
-			log.Printf("[kosha_accident] crawl error: %v", err)
-			newAccidents = nil
-		}
-
-		// Send oldest first; advance state per success, stop at first failure.
-		for i := len(newAccidents) - 1; i >= 0; i-- {
-			post := newAccidents[i]
-			totalNew++
-			sent := true
-			if post.ImageData != nil {
-				sent = notifier.TelegramSendPhoto(post.ImageData, "")
-			} else {
-				log.Printf("[kosha_accident] no image: %s -- skipping but advancing state", post.Title)
-			}
-			if !sent {
-				log.Printf("[kosha_accident] Telegram failed for #%s; batch stopped, will retry next run", post.PostID)
-				break
-			}
-			crawler.SaveLastID("kosha_accident", post.PostID)
-		}
-	} else {
-		log.Printf("[kosha_accident] skipped (filter)")
-	}
-
-	// 3) Archive crawlers (OPS/booklet/video, individual send)
-	archiveTypes := []string{"ops", "booklet", "video"}
-	for _, ct := range archiveTypes {
-		if !shouldRun("kosha_archive_" + ct) {
-			log.Printf("[kosha_archive_%s] skipped (filter)", ct)
-			continue
-		}
-		c := crawler.NewKoshaArchiveCrawler(ct)
-		newPosts, err := c.GetNewPosts()
-		if err != nil {
-			log.Printf("[%s] crawl error: %v", c.SiteName(), err)
-			continue
-		}
-
-		// Send oldest first; advance state per success, stop at first failure.
-		for i := len(newPosts) - 1; i >= 0; i-- {
-			post := newPosts[i]
-			totalNew++
-			var sent bool
-			if post.ImageData != nil {
-				sent = notifier.TelegramSendPhoto(post.ImageData, post.Title)
-			} else if post.FileData != nil && post.FileName != "" {
-				sent = notifier.TelegramSendDocument(post.FileData, post.FileName, post.Title)
-			} else {
-				// Text message for items without files (e.g., video links).
-				// Plain text mode -- no HTML escape needed.
-				msg := fmt.Sprintf("\U0001f4f9 [%s]\n%s\n%s", post.Source, post.Title, post.URL)
-				sent = notifier.TelegramSendMessage(msg)
-			}
-			if !sent {
-				log.Printf("[%s] Telegram failed for #%s; batch stopped, will retry next run", c.SiteName(), post.PostID)
-				break
-			}
-			crawler.SaveLastID(c.SiteName(), post.PostID)
-		}
-	}
-
-	// 4) eBook crawler (PDF, individual send)
-	if !shouldRun("kosha_ebook") {
-		log.Printf("[kosha_ebook] skipped (filter)")
-		log.Printf("=== Done: %d new notice(s) total ===", totalNew)
+	if len(crawlers) == 0 {
+		log.Println("no crawlers selected — nothing to do")
 		return
 	}
-	ebookCrawler := crawler.NewKoshaEbookCrawler()
-	newEbooks, err := ebookCrawler.GetNewPosts()
+
+	var sources []core.Source
+	for _, c := range crawlers {
+		sources = append(sources, source.NewAdapter(c))
+	}
+	multiSource := core.NewMultiSource(sources...)
+
+	// Multi-channel notifier — Telegram (HTML) and Band (plain-text).
+	// MultiNotifier reports success if at least one channel delivered,
+	// so a Band outage no longer causes Telegram duplicates next poll.
+	var notifiers []core.Notifier
+	if config.TelegramBotToken != "" {
+		tg, err := notify.NewTelegram(config.TelegramBotToken)
+		if err != nil {
+			log.Fatalf("Telegram init: %v", err)
+		}
+		notifiers = append(notifiers, tg)
+	}
+	if config.BandAccessToken != "" && config.BandKey != "" {
+		notifiers = append(notifiers, notify.NewBand(config.BandAccessToken, config.BandKey))
+	}
+	if len(notifiers) == 0 {
+		log.Fatal("no notifier configured (need TELEGRAM_BOT_TOKEN or BAND_ACCESS_TOKEN)")
+	}
+	multiNotifier := core.NewMultiNotifier(notifiers...)
+
+	dbPath := filepath.Join(projectRoot, "data", "safety-alarm.db")
+	st, err := store.Open(dbPath, "safety-alarm")
 	if err != nil {
-		log.Printf("[kosha_ebook] crawl error: %v", err)
-		newEbooks = nil
+		log.Fatalf("framework store open: %v", err)
+	}
+	if config.TelegramChatID != "" {
+		_ = st.Subscribe(config.TelegramChatID)
 	}
 
-	// Send oldest first; advance state per success, stop at first failure.
-	for i := len(newEbooks) - 1; i >= 0; i-- {
-		post := newEbooks[i]
-		totalNew++
-		var sent bool
-		if post.FileData != nil && post.FileName != "" {
-			sent = notifier.TelegramSendDocument(post.FileData, post.FileName, post.Title)
-		} else {
-			// eBook viewer link + PDF download links. HTML-escape user content
-			// because parse_mode=HTML is set.
-			var lines []string
-			lines = append(lines, fmt.Sprintf("\U0001f4d6 [%s] %s\n", html.EscapeString(post.Source), html.EscapeString(post.Title)))
-			lines = append(lines, fmt.Sprintf("\U0001f4d6 e-Book 보기\n%s", html.EscapeString(post.URL)))
-			for _, dl := range post.DownloadURLs {
-				lines = append(lines, fmt.Sprintf("\U0001f4e5 <a href=\"%s\">[다운로드] %s</a>",
-					html.EscapeString(dl.URL), html.EscapeString(dl.Label)))
-			}
-			sent = notifier.TelegramSendMessage(strings.Join(lines, "\n"))
-		}
-		if !sent {
-			log.Printf("[kosha_ebook] Telegram failed for #%s; batch stopped, will retry next run", post.PostID)
-			break
-		}
-		crawler.SaveLastID("kosha_ebook", post.PostID)
-	}
+	runner := bot.New(bot.Config{
+		Name:            "safety-alarm",
+		Source:          multiSource,
+		Formatter:       &SafetyFormatter{},
+		Notifier:        multiNotifier,
+		Store:           st,
+		ArchiveDir:      archiveDir(projectRoot),
+		HeartbeatDir:    heartbeatDir(),
+		MaxItemsPerPoll: maxSendPerRun,
+		OnNewItem: func(ctx context.Context, item core.Item) error {
+			return notifyhub.Push(notifyhub.Payload{
+				ChannelID: config.TelegramChatID,
+				Title:     item.Title,
+				URL:       item.URL,
+				Category:  item.Category,
+			})
+		},
+		OnError: func(err error) {
+			_ = notifyhub.LogPush("safety-alarm-bot", "error", err.Error(), "")
+		},
+	})
 
-	log.Printf("=== Done: %d new notice(s) total ===", totalNew)
+	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
+	defer cancel()
+	runner.PollOnce(ctx)
+
+	_ = notifyhub.LogPush("safety-alarm-bot", "info", "run finished", "")
+	log.Println("=== Safety Alarm Bot run complete ===")
+}
+
+func resolveProjectRoot() string {
+	if wd, err := os.Getwd(); err == nil {
+		if _, err := os.Stat(filepath.Join(wd, "data")); err == nil {
+			return wd
+		}
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		wd, _ := os.Getwd()
+		return wd
+	}
+	return filepath.Dir(exe)
+}
+
+func archiveDir(baseDir string) string {
+	if v := os.Getenv("ARCHIVE_DIR"); v != "" {
+		return v
+	}
+	return filepath.Join(baseDir, "data", "archive")
+}
+
+func heartbeatDir() string {
+	if v := os.Getenv("HEARTBEAT_DIR"); v != "" {
+		return v
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".txid-bots", "heartbeats")
 }
