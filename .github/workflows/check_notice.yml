@@ -8,6 +8,11 @@ on:
     - cron: '0,30 23 * * 0-4'   # KST 08:00, 08:30 (월~금)
     - cron: '0,30 0-9 * * 1-5'  # KST 09:00~18:30 (월~금)
   workflow_dispatch:  # 수동 실행
+    inputs:
+      bootstrap:
+        description: "First-deploy bootstrap (mark all items seen, skip dispatch)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -41,6 +46,16 @@ jobs:
       - name: Build
         run: go build -o safety-alarm-bot .
 
+      # Persist bot_seen across runs. Without this every scheduled run
+      # starts from an empty SQLite and would treat the existing
+      # backlog as new alerts.
+      - name: Restore framework DB cache
+        uses: actions/cache/restore@v4
+        with:
+          path: data/safety-alarm.db
+          key: safety-alarm-db-${{ github.run_id }}
+          restore-keys: safety-alarm-db-
+
       - name: Run bot (skip moel — runs from dell instead, see Korean IP requirement)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -50,7 +65,15 @@ jobs:
           NOTIFICATION_SECRET: ${{ secrets.NOTIFICATION_SECRET }}
           BAND_KEY: ${{ secrets.BAND_KEY }}
           SAFETY_ALARM_SKIP: moel
+          BOOTSTRAP_DEDUP: ${{ github.event.inputs.bootstrap == 'true' && '1' || '' }}
         run: ./safety-alarm-bot
+
+      - name: Save framework DB cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/safety-alarm.db
+          key: safety-alarm-db-${{ github.run_id }}
 
       - name: Commit updated state
         run: |
