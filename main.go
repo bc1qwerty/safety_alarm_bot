@@ -20,13 +20,18 @@ import (
 	"github.com/bc1qwerty/txid-bot-framework/pkg/store"
 )
 
+
 const (
 	runTimeout      = 5 * time.Minute
 	maxSendPerRun   = 10
 )
 
-// SafetyFormatter renders a safety notice as Telegram HTML and provides
-// a plain-text variant for channels (Naver Band) that cannot parse HTML.
+// SafetyFormatter renders a safety notice as Telegram HTML plus a
+// plain-text variant for channels (Naver Band) that can't parse HTML.
+// The output is intentionally minimal — title + link only. Any LLM-
+// generated commentary has been removed: it kept hallucinating
+// project-relevance ("직접 영향 없음 …") on unrelated notices, which
+// the channel owner explicitly does not want.
 type SafetyFormatter struct{}
 
 func (f *SafetyFormatter) Format(item core.Item) core.Message {
@@ -37,13 +42,6 @@ func (f *SafetyFormatter) Format(item core.Item) core.Message {
 
 	plain := fmt.Sprintf("[%s] 새 공지사항\n\n• %s\n  %s",
 		item.Category, item.Title, item.URL)
-
-	// Optional decision-aid: prepend a one-line AI take on whether this
-	// notice affects the user's projects. Best-effort, no failure.
-	if ai := source.AnalyzeNotice(item); ai != "" {
-		htmlText = "🤖 " + html.EscapeString(ai) + "\n\n" + htmlText
-		plain = "🤖 " + ai + "\n\n" + plain
-	}
 
 	return core.Message{
 		Text:      htmlText,
