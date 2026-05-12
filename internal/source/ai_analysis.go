@@ -62,18 +62,32 @@ func AnalyzeNotice(item core.Item) string {
 		return ""
 	}
 
-	line := strings.TrimSpace(string(out))
-	if line == "" {
-		return ""
+	return firstUsefulLine(string(out), 140)
+}
+
+// firstUsefulLine pulls the first informative line out of raw CLI
+// output. Both claude and gemini sprinkle harness chatter
+// ("No skills needed.", "```", empty lines, "Thinking...") before the
+// actual answer, so blindly taking strings[0] yields garbage.
+func firstUsefulLine(raw string, maxRunes int) string {
+	for _, l := range strings.Split(raw, "\n") {
+		s := strings.TrimSpace(l)
+		if s == "" {
+			continue
+		}
+		// skip code fences and common CLI metadata
+		if strings.HasPrefix(s, "```") ||
+			s == "No skills needed." ||
+			strings.HasPrefix(s, "Thinking") {
+			continue
+		}
+		runes := []rune(s)
+		if len(runes) > maxRunes {
+			s = string(runes[:maxRunes-3]) + "..."
+		}
+		return s
 	}
-	if idx := strings.IndexByte(line, '\n'); idx > 0 {
-		line = line[:idx]
-	}
-	runes := []rune(line)
-	if len(runes) > 140 {
-		line = string(runes[:137]) + "..."
-	}
-	return line
+	return ""
 }
 
 func buildSafetyPrompt(item core.Item) string {
