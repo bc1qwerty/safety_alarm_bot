@@ -61,12 +61,18 @@ jobs:
       # Persist bot_seen across runs. Without this every scheduled run
       # starts from an empty SQLite and would treat the existing
       # backlog as new alerts.
+      #
+      # Cache key prefix bumped to v2 on 2026-05-19 to invalidate the
+      # broken legacy caches that only contained the 250-byte schema-only
+      # main DB (the WAL sidecar was never captured, so every restore
+      # was effectively an empty DB and dedup was silently disabled —
+      # the bot redispatched up to 10 kosha_* items every 30 minutes).
       - name: Restore framework DB cache
         uses: actions/cache/restore@v4
         with:
           path: data/safety-alarm.db
-          key: safety-alarm-db-${{ github.run_id }}
-          restore-keys: safety-alarm-db-
+          key: safety-alarm-db-v2-${{ github.run_id }}
+          restore-keys: safety-alarm-db-v2-
 
       - name: Run bot (skip moel — runs from dell instead, see Korean IP requirement)
         env:
@@ -80,12 +86,23 @@ jobs:
           BOOTSTRAP_DEDUP: ${{ github.event.inputs.bootstrap == 'true' && '1' || '' }}
         run: ./safety-alarm-bot
 
+      # Defense in depth — main.go already runs PRAGMA wal_checkpoint on
+      # exit, but if the binary ever crashes mid-poll the WAL sidecar can
+      # still hold uncommitted rows. Force a TRUNCATE checkpoint so the
+      # cache step only needs to capture data/safety-alarm.db itself.
+      - name: Checkpoint WAL into main DB
+        if: always()
+        run: |
+          if [ -f data/safety-alarm.db ]; then
+            sqlite3 data/safety-alarm.db "PRAGMA wal_checkpoint(TRUNCATE);" || true
+          fi
+
       - name: Save framework DB cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: data/safety-alarm.db
-          key: safety-alarm-db-${{ github.run_id }}
+          key: safety-alarm-db-v2-${{ github.run_id }}
 
       - name: Commit updated state
         run: |

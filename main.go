@@ -140,6 +140,19 @@ func main() {
 	if err != nil {
 		log.Fatalf("framework store open: %v", err)
 	}
+	// store.Open uses journal_mode=WAL, so committed rows live in the -wal
+	// sidecar until a checkpoint folds them into the main db. GHA's cache
+	// step only captures data/safety-alarm.db, so without an explicit
+	// TRUNCATE checkpoint the restored DB next run is schema-only and the
+	// bot redispatches the same kosha_* backlog every 30 minutes.
+	defer func() {
+		if db := st.DB(); db != nil {
+			if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
+				log.Printf("[wal_checkpoint] %v", err)
+			}
+		}
+		_ = st.Close()
+	}()
 	if config.TelegramChatID != "" {
 		_ = st.Subscribe(config.TelegramChatID)
 	}
