@@ -4,34 +4,33 @@ import (
 	"testing"
 )
 
-// These tests lock in the rules that pairKoshaPosts must follow so the
-// title/URL off-by-one bug (caused by KOSHA mixing sticky and regular posts
-// in baseList) cannot silently regress.
+// These tests lock in the rules buildKoshaPosts must follow so the
+// title/URL pairing and the dedup-critical display-number ("No") scheme
+// cannot silently regress.
 //
-// Any change to the function must keep all four scenarios green:
+// Any change to the function must keep all scenarios green:
 //   - no stickies, only regulars
 //   - 1 sticky followed by regulars (the production-observed shape)
 //   - multiple stickies followed by regulars
-//   - rows whose display number breaks the totalCount-rnum+1 invariant must
-//     be dropped, not emitted with a wrong URL
+//   - a regular row whose pstNo has no title in bbsPstGrid must be dropped,
+//     not emitted with an empty title
+//   - empty input emits nothing
 
-func TestPairKoshaPosts_NoStickies(t *testing.T) {
-	rows := []koshaRowItem{
-		{Num: "100", Title: "post-100"},
-		{Num: "99", Title: "post-99"},
-		{Num: "98", Title: "post-98"},
-	}
-	base := []baseListItem{
+func TestBuildKoshaPosts_NoStickies(t *testing.T) {
+	grid := []koshaPstNoItem{
 		{Rnum: 1, PstNo: "P100", TotalCount: 100},
 		{Rnum: 2, PstNo: "P99", TotalCount: 100},
 		{Rnum: 3, PstNo: "P98", TotalCount: 100},
 	}
+	bbs := []koshaBbsPstItem{
+		{PstNo: "P100", PstNm: "post-100"},
+		{PstNo: "P99", PstNm: "post-99"},
+		{PstNo: "P98", PstNm: "post-98"},
+	}
 
-	got := pairKoshaPosts(rows, base, "src", "U?p=")
+	got := buildKoshaPosts(grid, bbs, 100, "src", "U?p=")
 
-	want := []struct {
-		id, title, url string
-	}{
+	want := []struct{ id, title, url string }{
 		{"100", "post-100", "U?p=P100"},
 		{"99", "post-99", "U?p=P99"},
 		{"98", "post-98", "U?p=P98"},
@@ -46,29 +45,28 @@ func TestPairKoshaPosts_NoStickies(t *testing.T) {
 	}
 }
 
-func TestPairKoshaPosts_OneStickyMatchesProductionBug(t *testing.T) {
-	// Real-world shape observed on 2026-05-11: one sticky pinned, regular
-	// posts start at #2742. Previous code paired No2742 with No2741's pstNo
-	// because the sticky's rnum=1 collided with the first regular's rnum=1.
-	rows := []koshaRowItem{
-		{Num: "STICKY", Title: "STICKY: should be filtered out"},
-		{Num: "2742", Title: "regular-2742"},
-		{Num: "2741", Title: "regular-2741"},
-		{Num: "2740", Title: "regular-2740"},
+func TestBuildKoshaPosts_OneStickyFilteredOut(t *testing.T) {
+	// Production shape: one pinned sticky (totalCount=1) ahead of regular
+	// posts (totalCount=totalNormalCnt). Both groups restart rnum at 1.
+	grid := []koshaPstNoItem{
+		{Rnum: 1, PstNo: "STICKY", TotalCount: 1},
+		{Rnum: 1, PstNo: "P2742", TotalCount: 2742},
+		{Rnum: 2, PstNo: "P2741", TotalCount: 2742},
+		{Rnum: 3, PstNo: "P2740", TotalCount: 2742},
 	}
-	base := []baseListItem{
-		{Rnum: 1, PstNo: "STICKY_PST", TotalCount: 1},
-		{Rnum: 1, PstNo: "PST_2742", TotalCount: 2742},
-		{Rnum: 2, PstNo: "PST_2741", TotalCount: 2742},
-		{Rnum: 3, PstNo: "PST_2740", TotalCount: 2742},
+	bbs := []koshaBbsPstItem{
+		{PstNo: "STICKY", PstNm: "sticky: should be filtered out"},
+		{PstNo: "P2742", PstNm: "regular-2742"},
+		{PstNo: "P2741", PstNm: "regular-2741"},
+		{PstNo: "P2740", PstNm: "regular-2740"},
 	}
 
-	got := pairKoshaPosts(rows, base, "src", "U?p=")
+	got := buildKoshaPosts(grid, bbs, 2742, "src", "U?p=")
 
 	want := map[string]string{
-		"2742": "U?p=PST_2742",
-		"2741": "U?p=PST_2741",
-		"2740": "U?p=PST_2740",
+		"2742": "U?p=P2742",
+		"2741": "U?p=P2741",
+		"2740": "U?p=P2740",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("len: got %d want %d", len(got), len(want))
@@ -76,7 +74,7 @@ func TestPairKoshaPosts_OneStickyMatchesProductionBug(t *testing.T) {
 	for _, p := range got {
 		wantURL, ok := want[p.PostID]
 		if !ok {
-			t.Errorf("unexpected PostID %q", p.PostID)
+			t.Errorf("unexpected PostID %q (sticky leaked?)", p.PostID)
 			continue
 		}
 		if p.URL != wantURL {
@@ -85,19 +83,10 @@ func TestPairKoshaPosts_OneStickyMatchesProductionBug(t *testing.T) {
 	}
 }
 
-func TestPairKoshaPosts_MultipleStickies(t *testing.T) {
-	// Defensive: hypothetical 3-sticky configuration. Each sticky has its own
-	// totalCount=1 entry; regulars share totalCount=500. The largest-group
-	// rule must still pick the regulars and produce correctly-ordered URLs.
-	rows := []koshaRowItem{
-		{Num: "공지", Title: "s1"},
-		{Num: "공지", Title: "s2"},
-		{Num: "공지", Title: "s3"},
-		{Num: "500", Title: "r500"},
-		{Num: "499", Title: "r499"},
-		{Num: "498", Title: "r498"},
-	}
-	base := []baseListItem{
+func TestBuildKoshaPosts_MultipleStickies(t *testing.T) {
+	// Defensive: 3-sticky configuration. Each sticky has its own totalCount=1
+	// entry; regulars share totalCount=500. Only the regulars are emitted.
+	grid := []koshaPstNoItem{
 		{Rnum: 1, PstNo: "S1", TotalCount: 1},
 		{Rnum: 1, PstNo: "S2", TotalCount: 1},
 		{Rnum: 1, PstNo: "S3", TotalCount: 1},
@@ -105,38 +94,42 @@ func TestPairKoshaPosts_MultipleStickies(t *testing.T) {
 		{Rnum: 2, PstNo: "R499", TotalCount: 500},
 		{Rnum: 3, PstNo: "R498", TotalCount: 500},
 	}
+	bbs := []koshaBbsPstItem{
+		{PstNo: "S1", PstNm: "s1"}, {PstNo: "S2", PstNm: "s2"}, {PstNo: "S3", PstNm: "s3"},
+		{PstNo: "R500", PstNm: "r500"}, {PstNo: "R499", PstNm: "r499"}, {PstNo: "R498", PstNm: "r498"},
+	}
 
-	got := pairKoshaPosts(rows, base, "src", "U?p=")
+	got := buildKoshaPosts(grid, bbs, 500, "src", "U?p=")
 	if len(got) != 3 {
 		t.Fatalf("len: got %d want 3", len(got))
 	}
-	expect := []string{"U?p=R500", "U?p=R499", "U?p=R498"}
+	expect := []struct{ id, url string }{
+		{"500", "U?p=R500"}, {"499", "U?p=R499"}, {"498", "U?p=R498"},
+	}
 	for i, e := range expect {
-		if got[i].URL != e {
-			t.Errorf("[%d]: got URL %q want %q", i, got[i].URL, e)
+		if got[i].PostID != e.id || got[i].URL != e.url {
+			t.Errorf("[%d]: got id=%s url=%q want id=%s url=%q", i, got[i].PostID, got[i].URL, e.id, e.url)
 		}
 	}
 }
 
-func TestPairKoshaPosts_InvariantBreakSkipsBadRow(t *testing.T) {
-	// Simulate KOSHA returning a row whose display number doesn't match
-	// (mainTotal - regularIdx + 1) -- e.g. schema change or duplicate row.
-	// Bad rows must be dropped, not paired with the wrong pstNo.
-	rows := []koshaRowItem{
-		{Num: "100", Title: "good-100"},
-		{Num: "97", Title: "bad: should be 99"},
-		{Num: "98", Title: "good-98"},
-	}
-	base := []baseListItem{
+func TestBuildKoshaPosts_MissingTitleSkipsRow(t *testing.T) {
+	// A regular pstNo absent from bbsPstGrid must be dropped, not emitted with
+	// an empty title.
+	grid := []koshaPstNoItem{
 		{Rnum: 1, PstNo: "P100", TotalCount: 100},
 		{Rnum: 2, PstNo: "P99", TotalCount: 100},
 		{Rnum: 3, PstNo: "P98", TotalCount: 100},
 	}
+	bbs := []koshaBbsPstItem{
+		{PstNo: "P100", PstNm: "good-100"},
+		{PstNo: "P98", PstNm: "good-98"}, // P99 intentionally missing
+	}
 
-	got := pairKoshaPosts(rows, base, "src", "U?p=")
+	got := buildKoshaPosts(grid, bbs, 100, "src", "U?p=")
 
 	if len(got) != 2 {
-		t.Fatalf("len: got %d want 2 (one row must be dropped)", len(got))
+		t.Fatalf("len: got %d want 2 (row without a title must be dropped)", len(got))
 	}
 	if got[0].PostID != "100" || got[0].URL != "U?p=P100" {
 		t.Errorf("[0]: %+v", got[0])
@@ -146,12 +139,8 @@ func TestPairKoshaPosts_InvariantBreakSkipsBadRow(t *testing.T) {
 	}
 }
 
-func TestPairKoshaPosts_EmptyBaseListEmitsNothing(t *testing.T) {
-	rows := []koshaRowItem{
-		{Num: "100", Title: "post"},
-	}
-	got := pairKoshaPosts(rows, nil, "src", "U?p=")
-	if len(got) != 0 {
-		t.Fatalf("expected 0 posts when baseList is empty, got %d", len(got))
+func TestBuildKoshaPosts_EmptyEmitsNothing(t *testing.T) {
+	if got := buildKoshaPosts(nil, nil, 0, "src", "U?p="); len(got) != 0 {
+		t.Fatalf("expected 0 posts for empty input, got %d", len(got))
 	}
 }

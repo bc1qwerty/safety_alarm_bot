@@ -1,26 +1,42 @@
 package crawler
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/chromedp/chromedp"
 )
 
 const (
 	koshaBoardURL  = "https://www.kosha.or.kr/notification/notice/contruction?bbsId=B2025021400001"
 	koshaDetailURL = koshaBoardURL + "&pstNo="
 	// koshaSource is the human-readable source label shown in notifications.
-	// Kept as a \uXXXX literal so the file is ASCII-clean across editors.
-	koshaSource = "안전보건공단" // 안전보건공단
+	koshaSource = "안전보건공단"
+
+	// koshaBbsID is the board id of 대표홈페이지 공지사항.
+	koshaBbsID = "B2025021400001"
+	// koshaProcessURL is the stdtboard JSON API behind the kosha24 Vue SPA.
+	// In 2026-05 KOSHA replaced the server-rendered notice board with a Vue
+	// single-page app: the old `.tboard_list_row` DOM and the `koshaTboard`
+	// JS global no longer exist, so the previous chromedp WaitVisible scrape
+	// hung for its full timeout ("context deadline exceeded"). The SPA loads
+	// the list from this endpoint, which we now call directly — no headless
+	// Chrome, faster, and immune to future DOM/markup changes.
+	koshaProcessURL = "https://www.kosha.or.kr/api/compn24/auth/stdtboard/process.do"
+	koshaUserAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36"
 )
 
-// KoshaNoticeCrawler crawls 안전보건공단 notices using chromedp.
+// koshaListReqTemplate is the process.do request payload for serviceId=basicAccess,
+// captured from the kosha24 SPA. %s is the bbsId. The SPA submits this JSON as a
+// URL-encoded value of the _JSON form field; FetchPosts replicates that encoding.
+const koshaListReqTemplate = `{"common":{"frontInfo":{"viewId":"","menuId":"","siteId":""},"frontAuthKey":"","auth":{},"securityInfo":{},"data":{"pagingInfo":null,"whereId":null,"tboard":{"systemCd":"50","channel":"web","bbsId":"%s","bbsGrpId":"","serviceId":"basicAccess"}}},"service":{"info":{"id":"","type":""},"data":{"searchDefaultCndGrid":[{"orPstNm":"","orPstCn":"","curPageCo":1,"recodePageCo":10,"rowsPerPage":10,"pstSeCd":"1200001","atcflCntSrchYn":"Y","artclNoList":[],"pstNoOrder":"Y","isDesc":"Y","sortType":"01","sortOrder":"1","isAddPstCn":"N"}],"searchArtclCndGrid":[]}}}`
+
+// KoshaNoticeCrawler crawls 안전보건공단 notices via the stdtboard JSON API.
 type KoshaNoticeCrawler struct {
 	BaseCrawler
 }
@@ -29,153 +45,136 @@ func NewKoshaNoticeCrawler() *KoshaNoticeCrawler {
 	return &KoshaNoticeCrawler{BaseCrawler{Name: "kosha"}}
 }
 
-// baseListItem represents an item from koshaTboard.bbsInfo.tboard.result.search.baseList.
-// KOSHA returns sticky notices first (each with totalCount=1) followed by regular posts
-// (totalCount=total regular count). Both groups restart rnum at 1, so we have to split
-// them by totalCount before mapping rnum -> pstNo, otherwise the sticky's pstNo is
-// overwritten by the first regular post's pstNo and every regular row is off by one.
-type baseListItem struct {
+// koshaProcessResp is the process.do JSON envelope (only the fields we consume).
+type koshaProcessResp struct {
+	Code     int    `json:"code"`
+	Message  string `json:"message"`
+	Response struct {
+		// TotalNormalCnt is the number of regular (non-sticky) posts. The
+		// board's visible "No" of the newest regular post equals this value.
+		TotalNormalCnt int `json:"totalNormalCnt"`
+		// PstNoGrid carries one entry per row in display order. KOSHA returns
+		// sticky notices first (totalCount=1 each) then regular posts
+		// (totalCount=totalNormalCnt); both groups restart rnum at 1.
+		PstNoGrid []koshaPstNoItem `json:"pstNoGrid"`
+		// BbsPstGrid carries post metadata (title) keyed by pstNo.
+		BbsPstGrid []koshaBbsPstItem `json:"bbsPstGrid"`
+	} `json:"response"`
+}
+
+// koshaPstNoItem maps a display row to its pstNo.
+type koshaPstNoItem struct {
 	Rnum       int    `json:"rnum"`
 	PstNo      string `json:"pstNo"`
 	TotalCount int    `json:"totalCount"`
 }
 
-// koshaRowItem is one row scraped from the KOSHA notice list DOM.
-type koshaRowItem struct {
-	Num   string `json:"num"`
-	Title string `json:"title"`
+// koshaBbsPstItem is one post's metadata; PstNm is the title.
+type koshaBbsPstItem struct {
+	PstNo string `json:"pstNo"`
+	PstNm string `json:"pstNm"`
 }
 
 func (c *KoshaNoticeCrawler) FetchPosts() ([]Post, error) {
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", true),
-		chromedp.Flag("no-sandbox", true),
-		chromedp.Flag("disable-dev-shm-usage", true),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("no-zygote", true),
-		chromedp.Flag("disable-setuid-sandbox", true),
-		chromedp.Flag("disable-features", "Translate,OptimizationHints,MediaRouter,InterestFeedContentSuggestions,VizDisplayCompositor"),
-		chromedp.Flag("disable-extensions", true),
-		chromedp.Flag("disable-default-apps", true),
-		chromedp.Flag("disable-background-timer-throttling", true),
-		chromedp.Flag("disable-backgrounding-occluded-windows", true),
-		chromedp.Flag("disable-renderer-backgrounding", true),
-		chromedp.WindowSize(1280, 720),
-	)
+	jsonBody := fmt.Sprintf(koshaListReqTemplate, koshaBbsID)
+	// The SPA sends `_JSON=encodeURIComponent(json)`; form encoding then
+	// escapes it a second time, so the value on the wire is double-encoded.
+	form := url.Values{}
+	form.Set("_JSON", url.QueryEscape(jsonBody))
 
-	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
-	defer allocCancel()
-
-	ctx, cancel := chromedp.NewContext(allocCtx)
-	defer cancel()
-
-	ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	var baseListJSON string
-	var rowItems []koshaRowItem
-
-	err := chromedp.Run(ctx,
-		chromedp.Navigate(koshaBoardURL),
-		chromedp.WaitVisible(".tboard_list_row", chromedp.ByQuery),
-		// Extract baseList from JS context (JSON.stringify so unmarshal to a Go string)
-		chromedp.Evaluate(`JSON.stringify(koshaTboard.bbsInfo.tboard.result.search.baseList)`, &baseListJSON),
-		// Return a native JS array of {num,title} - chromedp marshals it to []koshaRowItem directly.
-		chromedp.Evaluate(`
-			(() => {
-				const rows = document.querySelectorAll('.tboard_list_row');
-				const result = [];
-				rows.forEach(row => {
-					const numEl = row.querySelector("[data-tboard-artcl-no='D020100001']");
-					const titleEl = row.querySelector("a.tboard_list_subject");
-					if (numEl && titleEl) {
-						let num = numEl.textContent.trim().replace(/,/g, '').replace('No', '').trim();
-						let title = titleEl.getAttribute('title') || titleEl.textContent.trim();
-						result.push({num: num, title: title});
-					}
-				});
-				return result;
-			})()
-		`, &rowItems),
-	)
+	req, err := http.NewRequest(http.MethodPost, koshaProcessURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return nil, fmt.Errorf("[kosha] chromedp failed: %w", err)
+		return nil, fmt.Errorf("[kosha] build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+	req.Header.Set("User-Agent", koshaUserAgent)
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("[kosha] process.do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("[kosha] read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("[kosha] process.do HTTP %d", resp.StatusCode)
 	}
 
-	var baseList []baseListItem
-	if err := json.Unmarshal([]byte(baseListJSON), &baseList); err != nil {
-		return nil, fmt.Errorf("[kosha] baseList parse failed: %w", err)
+	var pr koshaProcessResp
+	if err := json.Unmarshal(body, &pr); err != nil {
+		return nil, fmt.Errorf("[kosha] response parse: %w", err)
+	}
+	if pr.Code != 0 {
+		return nil, fmt.Errorf("[kosha] process.do code=%d msg=%q", pr.Code, pr.Message)
 	}
 
-	posts := pairKoshaPosts(rowItems, baseList, koshaSource, koshaDetailURL)
-	log.Printf("[kosha] %d posts emitted (%d rows scraped, %d baseList entries)", len(posts), len(rowItems), len(baseList))
+	posts := buildKoshaPosts(pr.Response.PstNoGrid, pr.Response.BbsPstGrid,
+		pr.Response.TotalNormalCnt, koshaSource, koshaDetailURL)
+	log.Printf("[kosha] %d posts emitted (%d pstNoGrid, %d bbsPstGrid, totalNormal=%d)",
+		len(posts), len(pr.Response.PstNoGrid), len(pr.Response.BbsPstGrid), pr.Response.TotalNormalCnt)
 	return posts, nil
 }
 
-// pairKoshaPosts joins each numbered row with its pstNo. It is a pure function
-// so the off-by-one regression that this fix addresses can be locked in by
-// kosha_notice_test.go.
+// buildKoshaPosts joins the pstNoGrid display order with bbsPstGrid titles. It
+// is a pure function so its behavior can be locked in by kosha_notice_test.go.
 //
 // Mapping rules:
-//   - KOSHA's baseList contains two groups: stickies (totalCount=1 each) and
-//     regular posts (totalCount=N for all). Both groups restart rnum at 1, so
-//     we keep only the largest-totalCount group when building rnum -> pstNo.
-//   - Stickies in the DOM have non-numeric display numbers (e.g. "공지") and
-//     are filtered out by isDigits, after which regular rows are indexed by
-//     their position within the regular-only sequence (regularIdx).
-//
-// Invariant (locked in to prevent future silent regressions):
-//
-//	parsedDisplayNum == mainTotal - regularIdx + 1
-//
-// KOSHA always shows the newest post first with display number = totalCount,
-// and decrements per row. If a row violates this -- because KOSHA changes its
-// schema, inserts a new kind of row, or returns unexpected ordering -- the
-// row is dropped with a WARN log rather than emitted with a wrong URL. This
-// is the safeguard that prevents recurrence of the title/link mismatch.
-func pairKoshaPosts(rowItems []koshaRowItem, baseList []baseListItem, source, detailURL string) []Post {
-	mainTotal := 0
-	for _, item := range baseList {
-		if item.TotalCount > mainTotal {
-			mainTotal = item.TotalCount
+//   - pstNoGrid mixes stickies (totalCount=1) and regular posts
+//     (totalCount=totalNormalCnt). Stickies are pinned notices with no
+//     sequential number, so they are dropped — matching the pre-SPA crawler,
+//     which filtered the DOM's non-numeric "공지" rows.
+//   - PostID is the board's visible "No" = mainTotal - rnum + 1. This MUST stay
+//     stable: the framework dedups on the exact (source, PostID) pair and
+//     bot_seen already holds these display numbers from the chromedp-era
+//     crawler. Emitting pstNo instead would make every backlog item look new
+//     and redispatch it.
+//   - A regular pstNo with no matching title in bbsPstGrid is dropped with a
+//     WARN rather than emitted with an empty title.
+func buildKoshaPosts(pstNoGrid []koshaPstNoItem, bbsPstGrid []koshaBbsPstItem, totalNormalCnt int, source, detailURL string) []Post {
+	titles := make(map[string]string, len(bbsPstGrid))
+	for _, b := range bbsPstGrid {
+		titles[b.PstNo] = strings.TrimSpace(b.PstNm)
+	}
+
+	// mainTotal is the regular group's totalCount. totalNormalCnt is the
+	// authoritative value; fall back to the largest totalCount seen in the
+	// grid in case the envelope ever omits it.
+	mainTotal := totalNormalCnt
+	for _, e := range pstNoGrid {
+		if e.TotalCount > mainTotal {
+			mainTotal = e.TotalCount
 		}
 	}
-	pstMap := make(map[int]string)
-	for _, item := range baseList {
-		if item.TotalCount == mainTotal {
-			pstMap[item.Rnum] = item.PstNo
-		}
+	if mainTotal < 1 {
+		return nil
 	}
 
 	var posts []Post
-	regularIdx := 0
-	for _, row := range rowItems {
-		numText := strings.TrimSpace(row.Num)
-		if !isDigits(numText) {
+	for _, e := range pstNoGrid {
+		if e.TotalCount != mainTotal {
+			continue // sticky / pinned notice — no sequential "No"
+		}
+		displayNo := mainTotal - e.Rnum + 1
+		if displayNo < 1 {
+			log.Printf("[kosha] WARN pstNo=%s rnum=%d yields display=%d -- skipping",
+				e.PstNo, e.Rnum, displayNo)
 			continue
 		}
-		regularIdx++
-
-		if mainTotal > 0 {
-			parsedNum, _ := strconv.Atoi(numText)
-			expectedNum := mainTotal - regularIdx + 1
-			if parsedNum != expectedNum {
-				log.Printf("[kosha] WARN row#%d numText=%q expected display=%d -- skipping (sticky offset or schema change?)",
-					regularIdx, numText, expectedNum)
-				continue
-			}
-		}
-
-		pstNo, ok := pstMap[regularIdx]
-		if !ok || pstNo == "" {
-			log.Printf("[kosha] WARN row#%d (No%s) has no pstNo in baseList -- skipping", regularIdx, numText)
+		title, ok := titles[e.PstNo]
+		if !ok || title == "" {
+			log.Printf("[kosha] WARN pstNo=%s (No%d) missing title in bbsPstGrid -- skipping",
+				e.PstNo, displayNo)
 			continue
 		}
-
 		posts = append(posts, Post{
-			PostID: numText,
-			Title:  row.Title,
-			URL:    detailURL + pstNo,
+			PostID: strconv.Itoa(displayNo),
+			Title:  title,
+			URL:    detailURL + e.PstNo,
 			Source: source,
 		})
 	}
