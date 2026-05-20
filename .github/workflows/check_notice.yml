@@ -17,6 +17,13 @@ on:
 permissions:
   contents: write
 
+# Opt the Node-20 actions (checkout, cache, setup-go, setup-chrome) into the
+# Node 24 runtime ahead of the 2026-06-02 forced cutover. Cleaner than bumping
+# each action major one by one — actions/cache and browser-actions/setup-chrome
+# have no Node-24 release yet, so this env var covers them all at once.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   check:
     runs-on: ubuntu-latest
