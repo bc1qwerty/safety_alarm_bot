@@ -24,6 +24,12 @@ import (
 const (
 	runTimeout      = 5 * time.Minute
 	maxSendPerRun   = 10
+	// hubChannel is the txid notification-hub channel slug. It is NOT the
+	// Telegram chat id: the hub keys notifications by logical channel,
+	// while Telegram/Band delivery is handled separately by the
+	// notifiers. It doubles as the framework bot name and store namespace
+	// so all three stay in sync.
+	hubChannel = "safety-alarm"
 )
 
 // SafetyFormatter renders a safety notice as Telegram HTML plus a
@@ -136,7 +142,7 @@ func main() {
 	multiNotifier := core.NewMultiNotifier(notifiers...)
 
 	dbPath := filepath.Join(projectRoot, "data", "safety-alarm.db")
-	st, err := store.Open(dbPath, "safety-alarm")
+	st, err := store.Open(dbPath, hubChannel)
 	if err != nil {
 		log.Fatalf("framework store open: %v", err)
 	}
@@ -158,7 +164,7 @@ func main() {
 	}
 
 	runner := bot.New(bot.Config{
-		Name:            "safety-alarm",
+		Name:            hubChannel,
 		Source:          multiSource,
 		Formatter:       &SafetyFormatter{},
 		Notifier:        multiNotifier,
@@ -170,7 +176,7 @@ func main() {
 		BootstrapMode:   os.Getenv("BOOTSTRAP_DEDUP") == "1",
 		OnNewItem: func(ctx context.Context, item core.Item) error {
 			return notifyhub.Push(notifyhub.Payload{
-				ChannelID: config.TelegramChatID,
+				ChannelID: hubChannel,
 				Title:     item.Title,
 				URL:       item.URL,
 				Category:  item.Category,
