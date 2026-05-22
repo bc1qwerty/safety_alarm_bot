@@ -26,10 +26,11 @@ func (a *CrawlerAdapter) Fetch(ctx context.Context) ([]core.Item, error) {
 		return nil, err
 	}
 
+	prefix := a.crawler.SiteName()
 	var items []core.Item
 	for _, p := range posts {
 		items = append(items, core.Item{
-			ID:       p.PostID,
+			ID:       prefix + ":" + p.PostID,
 			Title:    p.Title,
 			URL:      p.URL,
 			Content:  p.Title, // Summary is the title for these alerts
