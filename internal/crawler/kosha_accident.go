@@ -23,6 +23,20 @@ const (
 	// requestID was never captured and the crawler reported "API response not
 	// captured". Now we wait on an actual EventLoadingFinished signal.
 	accidentAPIWait = 20 * time.Second
+	// accidentWSTimeout is how long chromedp waits for Chrome to print its
+	// "DevTools listening on ws://..." line. chromedp's library default is
+	// 20s; GitHub Actions' shared runners occasionally need longer to bring
+	// Chrome up under CPU/IO contention. A 20s miss surfaces as
+	// "navigate failed: websocket url timeout reached" and drops the whole
+	// accident source for that poll cycle (observed 2026-05-22).
+	accidentWSTimeout = 40 * time.Second
+	// accidentSessionTimeout bounds one browser session: WS startup headroom
+	// + navigate + accidentAPIWait + response-body fetch.
+	accidentSessionTimeout = 75 * time.Second
+	// accidentMaxAttempts retries the whole chromedp session so a one-off
+	// Chrome startup hang or navigate flake does not silently skip the
+	// source, mirroring the 3x retry in moel.go.
+	accidentMaxAttempts = 3
 )
 
 // KoshaAccidentCrawler crawls 중대재해 사이렌 using chromedp + CDP network capture.
@@ -45,7 +59,26 @@ type accidentAPIResponse struct {
 	} `json:"payload"`
 }
 
+// FetchPosts retries the chromedp session so a transient Chrome startup
+// hang ("websocket url timeout reached") or navigate flake on a shared CI
+// runner does not drop the whole accident source for a poll cycle.
 func (c *KoshaAccidentCrawler) FetchPosts() ([]Post, error) {
+	var lastErr error
+	for attempt := 1; attempt <= accidentMaxAttempts; attempt++ {
+		posts, err := c.fetchPostsOnce()
+		if err == nil {
+			return posts, nil
+		}
+		lastErr = err
+		log.Printf("[kosha_accident] attempt %d/%d failed: %v", attempt, accidentMaxAttempts, err)
+		if attempt < accidentMaxAttempts {
+			time.Sleep(time.Duration(attempt) * 3 * time.Second)
+		}
+	}
+	return nil, fmt.Errorf("[kosha_accident] failed after %d attempts: %w", accidentMaxAttempts, lastErr)
+}
+
+func (c *KoshaAccidentCrawler) fetchPostsOnce() ([]Post, error) {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", true),
 		chromedp.Flag("no-sandbox", true),
@@ -60,6 +93,7 @@ func (c *KoshaAccidentCrawler) FetchPosts() ([]Post, error) {
 		chromedp.Flag("disable-backgrounding-occluded-windows", true),
 		chromedp.Flag("disable-renderer-backgrounding", true),
 		chromedp.WindowSize(1280, 720),
+		chromedp.WSURLReadTimeout(accidentWSTimeout),
 	)
 
 	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
@@ -68,7 +102,7 @@ func (c *KoshaAccidentCrawler) FetchPosts() ([]Post, error) {
 	ctx, cancel := chromedp.NewContext(allocCtx)
 	defer cancel()
 
-	ctx, cancel = context.WithTimeout(ctx, 45*time.Second)
+	ctx, cancel = context.WithTimeout(ctx, accidentSessionTimeout)
 	defer cancel()
 
 	// Track every request whose URL contains apiKeyword (in case the page
