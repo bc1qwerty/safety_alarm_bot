@@ -137,6 +137,49 @@ func (c *KoshaArchiveCrawler) GetNewPosts() ([]Post, error) {
 	return FilterNewPosts(c.Name, posts), nil
 }
 
+// httpMaxAttempts bounds retries for the archive/notice JSON APIs, mirroring
+// the 3x retry moel.go uses for its flaky handshake.
+const httpMaxAttempts = 3
+
+// doWithRetry sends the request built by newReq and returns the response only
+// on HTTP 200 OK. It retries transport errors (client.Do failures), 5xx, and
+// 429 up to httpMaxAttempts with linear backoff (attempt*2s), mirroring
+// moel.go. Other 4xx are returned immediately. newReq is invoked fresh every
+// attempt so a POST body — consumed the moment it is first sent — is rebuilt
+// each time; a GET builder can just return the same request. On success the
+// caller owns resp.Body.
+func doWithRetry(client *http.Client, tag string, newReq func() (*http.Request, error)) (*http.Response, error) {
+	var lastErr error
+	for attempt := 1; attempt <= httpMaxAttempts; attempt++ {
+		req, err := newReq()
+		if err != nil {
+			return nil, err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			log.Printf("%s request failed (attempt %d/%d): %v", tag, attempt, httpMaxAttempts, err)
+			if attempt < httpMaxAttempts {
+				time.Sleep(time.Duration(attempt) * 2 * time.Second)
+				continue
+			}
+			return nil, err
+		}
+		if resp.StatusCode == http.StatusOK {
+			return resp, nil
+		}
+		resp.Body.Close()
+		if attempt < httpMaxAttempts && (resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests) {
+			log.Printf("%s HTTP %d (attempt %d/%d) — retrying", tag, resp.StatusCode, attempt, httpMaxAttempts)
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+			continue
+		}
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return nil, lastErr
+}
+
 func (c *KoshaArchiveCrawler) fetchList() ([]archiveItem, error) {
 	body := map[string]interface{}{
 		"shpCd":           c.shpCd,
@@ -148,23 +191,20 @@ func (c *KoshaArchiveCrawler) fetchList() ([]archiveItem, error) {
 	}
 	jsonBody, _ := json.Marshal(body)
 
-	req, err := http.NewRequest("POST", archiveListAPI, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Referer", archiveBaseURL+"/")
-
 	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := doWithRetry(client, "["+c.Name+"]", func() (*http.Request, error) {
+		req, err := http.NewRequest("POST", archiveListAPI, bytes.NewReader(jsonBody))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Referer", archiveBaseURL+"/")
+		return req, nil
+	})
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
 
 	var result archiveListResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -176,24 +216,20 @@ func (c *KoshaArchiveCrawler) fetchList() ([]archiveItem, error) {
 func (c *KoshaArchiveCrawler) downloadThumbnail(thumbAtcflNo string) []byte {
 	url := fmt.Sprintf("%s?atcflNo=%s,1", archiveThumbnailAPI, thumbAtcflNo)
 
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		log.Printf("[%s] thumbnail request create failed: %v", c.Name, err)
-		return nil
-	}
-	req.Header.Set("Referer", archiveBaseURL+"/")
-
 	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := doWithRetry(client, "["+c.Name+"]", func() (*http.Request, error) {
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Referer", archiveBaseURL+"/")
+		return req, nil
+	})
 	if err != nil {
 		log.Printf("[%s] thumbnail download failed: %v", c.Name, err)
 		return nil
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -212,24 +248,21 @@ func (c *KoshaArchiveCrawler) getFileInfo(atcflNo string) *archiveFileInfo {
 	}
 	jsonBody, _ := json.Marshal(body)
 
-	req, err := http.NewRequest("POST", archiveFileListAPI, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Referer", archiveBaseURL+"/")
-
 	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := doWithRetry(client, "["+c.Name+"]", func() (*http.Request, error) {
+		req, err := http.NewRequest("POST", archiveFileListAPI, bytes.NewReader(jsonBody))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Referer", archiveBaseURL+"/")
+		return req, nil
+	})
 	if err != nil {
 		log.Printf("[%s] file info request failed: %v", c.Name, err)
 		return nil
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
 
 	var result struct {
 		Payload []archiveFileInfo `json:"payload"`
@@ -276,24 +309,21 @@ func (c *KoshaArchiveCrawler) downloadBlob(atcflNo string, seq int) []byte {
 	}
 	jsonBody, _ := json.Marshal(body)
 
-	req, err := http.NewRequest("POST", archiveFileDownload, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Referer", archiveBaseURL+"/")
-
 	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := doWithRetry(client, "["+c.Name+"]", func() (*http.Request, error) {
+		req, err := http.NewRequest("POST", archiveFileDownload, bytes.NewReader(jsonBody))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Referer", archiveBaseURL+"/")
+		return req, nil
+	})
 	if err != nil {
 		log.Printf("[%s] file download failed: %v", c.Name, err)
 		return nil
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {

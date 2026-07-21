@@ -81,17 +81,21 @@ func (c *KoshaNoticeCrawler) FetchPosts() ([]Post, error) {
 	// escapes it a second time, so the value on the wire is double-encoded.
 	form := url.Values{}
 	form.Set("_JSON", url.QueryEscape(jsonBody))
-
-	req, err := http.NewRequest(http.MethodPost, koshaProcessURL, strings.NewReader(form.Encode()))
-	if err != nil {
-		return nil, fmt.Errorf("[kosha] build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-	req.Header.Set("User-Agent", koshaUserAgent)
-	req.Header.Set("Accept", "application/json, text/plain, */*")
+	encoded := form.Encode()
 
 	client := &http.Client{Timeout: 20 * time.Second}
-	resp, err := client.Do(req)
+	// POST: doWithRetry rebuilds the request each attempt so strings.NewReader
+	// gets a fresh (un-consumed) body reader on every retry.
+	resp, err := doWithRetry(client, "[kosha]", func() (*http.Request, error) {
+		req, err := http.NewRequest(http.MethodPost, koshaProcessURL, strings.NewReader(encoded))
+		if err != nil {
+			return nil, fmt.Errorf("[kosha] build request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+		req.Header.Set("User-Agent", koshaUserAgent)
+		req.Header.Set("Accept", "application/json, text/plain, */*")
+		return req, nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("[kosha] process.do request: %w", err)
 	}
@@ -100,9 +104,6 @@ func (c *KoshaNoticeCrawler) FetchPosts() ([]Post, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("[kosha] read response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("[kosha] process.do HTTP %d", resp.StatusCode)
 	}
 
 	var pr koshaProcessResp
