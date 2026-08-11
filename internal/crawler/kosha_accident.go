@@ -7,10 +7,9 @@ import (
 	"fmt"
 	"log"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/cdproto/fetch"
 	"github.com/chromedp/chromedp"
 )
 
@@ -105,61 +104,52 @@ func (c *KoshaAccidentCrawler) fetchPostsOnce() ([]Post, error) {
 	ctx, cancel = context.WithTimeout(ctx, accidentSessionTimeout)
 	defer cancel()
 
-	// Track every request whose URL contains apiKeyword (in case the page
-	// fires more than one). Signal respDone the moment any of them finishes
-	// loading -- that request ID is the one we'll fetch the body from.
-	var pendingMu sync.Mutex
-	pending := make(map[network.RequestID]bool)
-	respDone := make(chan network.RequestID, 1)
-
+	// Intercept the API call at the Response stage. Pausing the request pins
+	// its body until we read it, so GetResponseBody no longer races Chrome's
+	// inspector cache. The previous network.GetResponseBody hit "Request
+	// content was evicted from inspector cache (-32000)" because this payload
+	// is large (base64 images inline) and Chrome evicted it before the
+	// deferred fetch could run.
+	paused := make(chan fetch.RequestID, 1)
 	chromedp.ListenTarget(ctx, func(ev interface{}) {
-		switch e := ev.(type) {
-		case *network.EventResponseReceived:
-			if strings.Contains(e.Response.URL, apiKeyword) {
-				pendingMu.Lock()
-				pending[e.RequestID] = true
-				pendingMu.Unlock()
-			}
-		case *network.EventLoadingFinished:
-			pendingMu.Lock()
-			matched := pending[e.RequestID]
-			if matched {
-				delete(pending, e.RequestID)
-			}
-			pendingMu.Unlock()
-			if matched {
-				select {
-				case respDone <- e.RequestID:
-				default:
-				}
-			}
+		e, ok := ev.(*fetch.EventRequestPaused)
+		if !ok || !strings.Contains(e.Request.URL, apiKeyword) {
+			return
+		}
+		select {
+		case paused <- e.RequestID:
+		default:
 		}
 	})
 
 	if err := chromedp.Run(ctx,
-		network.Enable(),
+		fetch.Enable().WithPatterns([]*fetch.RequestPattern{
+			{URLPattern: "*" + apiKeyword + "*", RequestStage: fetch.RequestStageResponse},
+		}),
 		chromedp.Navigate(accidentListURL),
 	); err != nil {
 		return nil, fmt.Errorf("[kosha_accident] navigate failed: %w", err)
 	}
 
-	// Wait for the API response to finish loading.
-	var capturedRequestID network.RequestID
+	// Wait for the intercepted API response.
+	var reqID fetch.RequestID
 	select {
-	case capturedRequestID = <-respDone:
+	case reqID = <-paused:
 	case <-time.After(accidentAPIWait):
 		return nil, fmt.Errorf("[kosha_accident] timed out (%s) waiting for %s response", accidentAPIWait, apiKeyword)
 	case <-ctx.Done():
 		return nil, fmt.Errorf("[kosha_accident] context cancelled while waiting for API: %w", ctx.Err())
 	}
 
-	var capturedBody string
+	var capturedBody []byte
 	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-		body, err := network.GetResponseBody(capturedRequestID).Do(ctx)
+		body, err := fetch.GetResponseBody(reqID).Do(ctx)
 		if err != nil {
 			return err
 		}
-		capturedBody = string(body)
+		capturedBody = body
+		// Release the paused request so the page can settle.
+		_ = fetch.ContinueRequest(reqID).Do(ctx)
 		return nil
 	})); err != nil {
 		return nil, fmt.Errorf("[kosha_accident] get response body failed: %w", err)
@@ -167,7 +157,7 @@ func (c *KoshaAccidentCrawler) fetchPostsOnce() ([]Post, error) {
 
 	// Parse the API response
 	var apiResp accidentAPIResponse
-	if err := json.Unmarshal([]byte(capturedBody), &apiResp); err != nil {
+	if err := json.Unmarshal(capturedBody, &apiResp); err != nil {
 		return nil, fmt.Errorf("[kosha_accident] JSON parse failed: %w", err)
 	}
 
