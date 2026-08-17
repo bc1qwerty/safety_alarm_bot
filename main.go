@@ -53,6 +53,13 @@ func (f *SafetyFormatter) Format(item core.Item) core.Message {
 		Text:      htmlText,
 		PlainText: plain,
 		ParseMode: "HTML",
+		// 중대재해 사이렌 posts are a poster image with the accident details
+		// on it; the title alone says almost nothing. Carrying the bytes
+		// through makes Telegram render the notice inline instead of
+		// forcing a click through to KOSHA's list page. Sources without
+		// an image are unaffected — the notifier falls back to text.
+		ImageData: item.ImageData,
+		ImageName: item.ImageName,
 	}
 }
 
