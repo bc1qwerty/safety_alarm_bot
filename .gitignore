@@ -9,3 +9,16 @@ safety-alarm-bot
 # OMC plugin state
 .omc/
 data/archive/
+
+# 토큰이 든 백업본. .env 만 제외돼 있어서 .env.bak 은 노출된 상태였다
+# (2026-08-18, `git add -A` 가 실제로 스테이징해 gitleaks 훅이 막았다).
+.env.*
+!.env.example
+
+# 빌드 산출물 — .gitignore 에는 하이픈 이름만 있었는데 실제로는 두 이름이 다 생긴다
+safety_alarm_bot
+
+# 런타임 상태·로그
+run.log
+data/*.db
+.claude/
