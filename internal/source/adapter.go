@@ -71,6 +71,19 @@ func (a *CrawlerAdapter) Fetch(ctx context.Context) ([]core.Item, error) {
 			item.ImageData = p.ImageData
 			item.ImageName = prefix + "-" + p.PostID + imageExt(p.ImageData)
 		}
+		// A crawler that produced FileData already decided the attachment is
+		// the material itself (a KOSHA OPS sheet, a booklet PDF), and it
+		// checked Telegram's size cap before downloading. No whitelist here:
+		// unlike a thumbnail, there is no case where the actual document is
+		// the wrong thing to post.
+		//
+		// Until this existed the bytes were fetched and then dropped on the
+		// floor — booklet and video crawlers had been downloading files that
+		// never reached the channel.
+		if len(p.FileData) > 0 {
+			item.FileData = p.FileData
+			item.FileName = p.FileName
+		}
 		items = append(items, item)
 	}
 	return items, nil

@@ -60,6 +60,12 @@ func (f *SafetyFormatter) Format(item core.Item) core.Message {
 		// an image are unaffected — the notifier falls back to text.
 		ImageData: item.ImageData,
 		ImageName: item.ImageName,
+		// 자료실 항목(OPS·소책자)은 본문이 PDF다. 제목만 보내면 매번 KOSHA
+		// 목록 페이지를 눌러 들어가야 확인이 된다. 파일을 실어 보내면 채널에서
+		// 바로 열리고, 사진이 아니라 문서로 보내므로 텔레그램이 재인코딩해
+		// 잔글씨를 뭉개지 않는다.
+		FileData: item.FileData,
+		FileName: item.FileName,
 	}
 }
 

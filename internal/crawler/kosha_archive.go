@@ -93,7 +93,19 @@ func (c *KoshaArchiveCrawler) FetchPosts() ([]Post, error) {
 
 		switch c.ContentType {
 		case "ops":
-			if item.ThumbAtcflNo != "" {
+			// OPS 자료는 본문이 PDF 한 장이다. 예전에는 썸네일만 받았는데,
+			// 그건 표지 미리보기라 내용을 읽을 수 없어 결국 링크를 눌러야 했다.
+			// 본문 파일을 실어 보내면 채널에서 바로 열린다.
+			if item.ContsAtcflNo != "" {
+				fileBytes, fileName := c.downloadFile(item.ContsAtcflNo)
+				if fileBytes != nil {
+					post.FileData = fileBytes
+					post.FileName = fileName
+				}
+			}
+			// 본문을 못 받은 경우(용량 초과·다운로드 실패)에만 썸네일로 물러선다.
+			// 둘 다 실으면 항목마다 메시지가 두 개씩 나간다.
+			if post.FileData == nil && item.ThumbAtcflNo != "" {
 				post.ImageData = c.downloadThumbnail(item.ThumbAtcflNo)
 			}
 		case "booklet":
