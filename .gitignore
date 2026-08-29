@@ -22,3 +22,6 @@ safety_alarm_bot
 run.log
 data/*.db
 .claude/
+
+# 배포 전 만든 롤백용 바이너리 사본. 공개 리포라 실수로도 올라가면 안 된다.
+*.bak-*
