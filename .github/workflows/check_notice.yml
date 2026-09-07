@@ -81,6 +81,23 @@ jobs:
           key: safety-alarm-db-v2-${{ github.run_id }}
           restore-keys: safety-alarm-db-v2-
 
+      # ⚠ dedup 네임스페이스 이관(2026-09-08). 프레임워크가 bot_seen 키로
+      # MultiSource 의 합성 이름(`multi[하위소스 목록]`)을 쓰던 시절의 캐시가
+      # 남아 있으면, 하위 소스별 dedup 으로 바뀐 첫 실행에서 백로그가 전부
+      # 신규로 보이고 MaxItemsPerPoll(10) 초과분이 **발송 없이 seen 처리돼
+      # 영구 유실**된다. mac 에서 실제로 그 사고를 한 번 냈다(신규 8건 중
+      # 7건 유실, kosha_accident 5건 포함 — 수동 복구함).
+      #
+      # 이 스텝은 멱등이다: 옮길 행이 없으면 아무것도 하지 않는다. 캐시가
+      # 언제 갱신되든 자기 치유되도록 매 실행에 둔다.
+      - name: Migrate dedup namespace (idempotent)
+        run: |
+          if [ -f data/safety-alarm.db ]; then
+            ./scripts/migrate-dedup-namespace.sh data/safety-alarm.db --apply
+          else
+            echo "캐시 DB 가 없다 — 첫 실행이거나 캐시 미스. 이관 불필요."
+          fi
+
       - name: Run bot (skip moel — runs from dell instead, see Korean IP requirement)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
