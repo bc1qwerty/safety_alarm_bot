@@ -98,6 +98,53 @@ jobs:
             echo "캐시 DB 가 없다 — 첫 실행이거나 캐시 미스. 이관 불필요."
           fi
 
+      # ⚠ dedup 상태의 유일한 사본이 이 캐시다. 없어지면(7일 미접근, 리포 10GB 초과,
+      #   수동 삭제) 빈 DB 로 봇이 뜨고 크롤한 글 전부가 신규로 보인다. 그러면
+      #   MaxItemsPerPoll(10) 초과분이 **발송 없이 seen 처리돼 영구 유실**된다.
+      #   위 v2 주석이 바로 그 사고의 기록이다 — 깨진 캐시가 사실상 빈 DB 였고
+      #   dedup 이 조용히 꺼져 있었다. 2026-09-08 에는 같은 결말을 낡은 바이너리가
+      #   만들어 7건을 잃었다. 방아쇠만 다를 뿐 결말은 늘 같다.
+      #
+      #   BOOTSTRAP_DEDUP 은 이미 있었지만 **수동 dispatch 입력으로만** 켤 수 있었다.
+      #   캐시 미스는 job 실패가 아니라 아무 신호도 없으므로, 사람이 그 입력을 켜야
+      #   한다는 사실을 알 방법이 없다. 자동으로 판정한다.
+      #
+      #   판정은 cache-hit 출력이 아니라 **파일 존재와 크기**로 한다 — restore-keys
+      #   부분일치일 때 cache-hit 은 false 이고, 위 v2 사고처럼 250바이트짜리 껍데기가
+      #   복원되는 경우도 있다. 실제로 쓸 수 있는 DB 인지를 본다.
+      #   ⚠ "판정 실패" 와 "0행" 을 반드시 구분한다. sqlite3 가 없어졌을 때 그것을
+      #   0행으로 뭉뚱그리면 매 실행이 부트스트랩이 되고 **봇이 영구히 조용해진다** —
+      #   막으려던 유실보다 나쁘다. 판정할 수 없으면 정상으로 두고 그 사실을 알린다
+      #   (check-unpushed 의 "판정 불능" 과 같은 처리).
+      - name: Detect dedup cache loss
+        id: dedup-state
+        run: |
+          DB=data/safety-alarm.db
+          if ! command -v sqlite3 >/dev/null 2>&1; then
+            BOOT=0; REASON="sqlite3 가 없어 판정 불능 — 이번엔 정상으로 두지만 유실 감시가 꺼져 있다"; LEVEL=warn
+          elif [ ! -s "$DB" ]; then
+            BOOT=1; REASON="DB 파일이 없거나 비어 있다"; LEVEL=loss
+          elif ! ROWS=$(sqlite3 "$DB" 'SELECT COUNT(*) FROM bot_seen;' 2>/dev/null); then
+            BOOT=1; REASON="bot_seen 조회 실패 — 스키마가 깨졌다"; LEVEL=loss
+          elif [ "$ROWS" -eq 0 ]; then
+            BOOT=1; REASON="bot_seen 0행 (250바이트 껍데기 캐시가 복원됐을 때의 모습이다)"; LEVEL=loss
+          else
+            BOOT=0; REASON="bot_seen ${ROWS}행 — 정상"; LEVEL=ok
+          fi
+          echo "bootstrap=$BOOT" >> "$GITHUB_OUTPUT"
+          echo "판정: $REASON (bootstrap=$BOOT)"
+          [ "$LEVEL" = ok ] && exit 0
+          echo "::warning::$REASON"
+          if [ "$LEVEL" = loss ]; then
+            TEXT="🟠 safety_alarm dedup 캐시 유실%0A${REASON}%0A이번 실행은 발송 없이 재수립만 합니다(한 주기 누락).%0A반복되면 캐시 대신 영속 저장소를 검토하세요."
+          else
+            TEXT="🟠 safety_alarm dedup 감시 불능%0A${REASON}"
+          fi
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d text="${TEXT}%0A로그: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            > /dev/null || true
+
       - name: Run bot (skip moel — runs from dell instead, see Korean IP requirement)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -107,7 +154,8 @@ jobs:
           NOTIFICATION_SECRET: ${{ secrets.NOTIFICATION_SECRET }}
           BAND_KEY: ${{ secrets.BAND_KEY }}
           SAFETY_ALARM_SKIP: moel
-          BOOTSTRAP_DEDUP: ${{ github.event.inputs.bootstrap == 'true' && '1' || '' }}
+          # 수동 dispatch 로 켜거나, 위에서 캐시 유실이 감지되면 자동으로 켜진다.
+          BOOTSTRAP_DEDUP: ${{ (github.event.inputs.bootstrap == 'true' || steps.dedup-state.outputs.bootstrap == '1') && '1' || '' }}
         run: ./safety-alarm-bot
 
       # Defense in depth — main.go already runs PRAGMA wal_checkpoint on
