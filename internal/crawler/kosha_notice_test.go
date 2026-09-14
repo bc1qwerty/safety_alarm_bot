@@ -5,8 +5,9 @@ import (
 )
 
 // These tests lock in the rules buildKoshaPosts must follow so the
-// title/URL pairing and the dedup-critical display-number ("No") scheme
-// cannot silently regress.
+// title/URL pairing and the dedup-critical key scheme (PostID=pstNo,
+// LegacyPostID=display "No" for the transition shim) cannot silently
+// regress.
 //
 // Any change to the function must keep all scenarios green:
 //   - no stickies, only regulars
@@ -30,17 +31,17 @@ func TestBuildKoshaPosts_NoStickies(t *testing.T) {
 
 	got := buildKoshaPosts(grid, bbs, 100, "src", "U?p=")
 
-	want := []struct{ id, title, url string }{
-		{"100", "post-100", "U?p=P100"},
-		{"99", "post-99", "U?p=P99"},
-		{"98", "post-98", "U?p=P98"},
+	want := []struct{ id, legacy, title, url string }{
+		{"P100", "100", "post-100", "U?p=P100"},
+		{"P99", "99", "post-99", "U?p=P99"},
+		{"P98", "98", "post-98", "U?p=P98"},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("len: got %d want %d", len(got), len(want))
 	}
 	for i, w := range want {
-		if got[i].PostID != w.id || got[i].Title != w.title || got[i].URL != w.url {
-			t.Errorf("[%d]: got %+v want id=%s title=%s url=%s", i, got[i], w.id, w.title, w.url)
+		if got[i].PostID != w.id || got[i].LegacyPostID != w.legacy || got[i].Title != w.title || got[i].URL != w.url {
+			t.Errorf("[%d]: got %+v want id=%s legacy=%s title=%s url=%s", i, got[i], w.id, w.legacy, w.title, w.url)
 		}
 	}
 }
@@ -63,22 +64,24 @@ func TestBuildKoshaPosts_OneStickyFilteredOut(t *testing.T) {
 
 	got := buildKoshaPosts(grid, bbs, 2742, "src", "U?p=")
 
-	want := map[string]string{
-		"2742": "U?p=P2742",
-		"2741": "U?p=P2741",
-		"2740": "U?p=P2740",
+	// PostID is the immutable pstNo; LegacyPostID is the display number
+	// the pre-2026-09 crawler used as the dedup key.
+	want := map[string]struct{ legacy, url string }{
+		"P2742": {"2742", "U?p=P2742"},
+		"P2741": {"2741", "U?p=P2741"},
+		"P2740": {"2740", "U?p=P2740"},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("len: got %d want %d", len(got), len(want))
 	}
 	for _, p := range got {
-		wantURL, ok := want[p.PostID]
+		w, ok := want[p.PostID]
 		if !ok {
 			t.Errorf("unexpected PostID %q (sticky leaked?)", p.PostID)
 			continue
 		}
-		if p.URL != wantURL {
-			t.Errorf("PostID %s: got URL %q want %q", p.PostID, p.URL, wantURL)
+		if p.URL != w.url || p.LegacyPostID != w.legacy {
+			t.Errorf("PostID %s: got url=%q legacy=%q want url=%q legacy=%q", p.PostID, p.URL, p.LegacyPostID, w.url, w.legacy)
 		}
 	}
 }
@@ -103,12 +106,13 @@ func TestBuildKoshaPosts_MultipleStickies(t *testing.T) {
 	if len(got) != 3 {
 		t.Fatalf("len: got %d want 3", len(got))
 	}
-	expect := []struct{ id, url string }{
-		{"500", "U?p=R500"}, {"499", "U?p=R499"}, {"498", "U?p=R498"},
+	expect := []struct{ id, legacy, url string }{
+		{"R500", "500", "U?p=R500"}, {"R499", "499", "U?p=R499"}, {"R498", "498", "U?p=R498"},
 	}
 	for i, e := range expect {
-		if got[i].PostID != e.id || got[i].URL != e.url {
-			t.Errorf("[%d]: got id=%s url=%q want id=%s url=%q", i, got[i].PostID, got[i].URL, e.id, e.url)
+		if got[i].PostID != e.id || got[i].LegacyPostID != e.legacy || got[i].URL != e.url {
+			t.Errorf("[%d]: got id=%s legacy=%s url=%q want id=%s legacy=%s url=%q",
+				i, got[i].PostID, got[i].LegacyPostID, got[i].URL, e.id, e.legacy, e.url)
 		}
 	}
 }
@@ -131,10 +135,10 @@ func TestBuildKoshaPosts_MissingTitleSkipsRow(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("len: got %d want 2 (row without a title must be dropped)", len(got))
 	}
-	if got[0].PostID != "100" || got[0].URL != "U?p=P100" {
+	if got[0].PostID != "P100" || got[0].LegacyPostID != "100" || got[0].URL != "U?p=P100" {
 		t.Errorf("[0]: %+v", got[0])
 	}
-	if got[1].PostID != "98" || got[1].URL != "U?p=P98" {
+	if got[1].PostID != "P98" || got[1].LegacyPostID != "98" || got[1].URL != "U?p=P98" {
 		t.Errorf("[1]: %+v", got[1])
 	}
 }

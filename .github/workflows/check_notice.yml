@@ -3,10 +3,18 @@ name: Check Safety Notices
 on:
   schedule:
     # UTC 기준 (KST = UTC+9)
-    # KST 08:00~18:00 사이 30분 간격 실행
-    # UTC 23:00~09:00
-    - cron: '0,30 23 * * 0-4'   # KST 08:00, 08:30 (월~금)
-    - cron: '0,30 0-9 * * 1-5'  # KST 09:00~18:30 (월~금)
+    # KST 08:07~18:37 사이 30분 간격 실행
+    # UTC 23:07~09:37
+    #
+    # ⚠분(minute)을 0,30 이 아니라 7,37 로 둔 이유: GitHub 의 스케줄러는
+    #   정시·30분 정각에 가장 붐벼 큐잉이 심하다(공식 문서도 "run at a
+    #   different time of the hour" 권고). 0,30 이던 2026-09-02~11 실측은
+    #   설계 22회/일 중 3~4회만 실행됐고(00:42/04:06/09:02/13:43Z 패턴),
+    #   대부분의 트리거가 시간 단위로 밀리다 소실됐다. 분 오프셋은 이를
+    #   완화하는 리포 안의 유일한 손잡이다 — 바꾼 뒤 gh run list 로 실행
+    #   횟수가 실제로 늘었는지 다시 잴 것.
+    - cron: '7,37 23 * * 0-4'   # KST 08:07, 08:37 (월~금)
+    - cron: '7,37 0-9 * * 1-5'  # KST 09:07~18:37 (월~금)
   workflow_dispatch:  # 수동 실행
     inputs:
       bootstrap:
@@ -15,7 +23,7 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: read
 
 # Opt the Node-20 actions (checkout, cache, setup-go, setup-chrome) into the
 # Node 24 runtime ahead of the 2026-06-02 forced cutover. Cleaner than bumping
@@ -175,11 +183,3 @@ jobs:
         with:
           path: data/safety-alarm.db
           key: safety-alarm-db-v2-${{ github.run_id }}
-
-      - name: Commit updated state
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/last_post_ids.json
-          git diff --cached --quiet || git commit -m "chore: update last_post_ids"
-          git push

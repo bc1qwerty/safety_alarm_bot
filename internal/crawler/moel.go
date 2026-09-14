@@ -113,20 +113,12 @@ func (c *MoelCrawler) FetchPosts() ([]Post, error) {
 			PostID: numText,
 			Title:  title,
 			URL:    href,
-			Source:  "\uACE0\uC6A9\uB178\uB3D9\uBD80", // 고용노동부
+			Source: "\uACE0\uC6A9\uB178\uB3D9\uBD80", // 고용노동부
 		})
 	})
 
 	log.Printf("[moel] %d posts parsed", len(posts))
 	return posts, nil
-}
-
-func (c *MoelCrawler) GetNewPosts() ([]Post, error) {
-	posts, err := c.FetchPosts()
-	if err != nil {
-		return nil, err
-	}
-	return FilterNewPosts(c.Name, posts), nil
 }
 
 func isDigits(s string) bool {

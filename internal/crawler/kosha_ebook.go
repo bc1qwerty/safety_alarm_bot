@@ -21,17 +21,18 @@ const (
 )
 
 var (
-	sdirRe    = regexp.MustCompile(`sdir=(\d+)`)
+	sdirRe     = regexp.MustCompile(`sdir=(\d+)`)
 	pdfFilesRe = regexp.MustCompile(`show_download\('([^']*)',\s*'([^']*)'`)
 )
 
 // KoshaEbookCrawler crawls 월간 안전보건 e-Book.
 type KoshaEbookCrawler struct {
 	BaseCrawler
+	seen SeenFunc
 }
 
-func NewKoshaEbookCrawler() *KoshaEbookCrawler {
-	return &KoshaEbookCrawler{BaseCrawler{Name: "kosha_ebook"}}
+func NewKoshaEbookCrawler(seen SeenFunc) *KoshaEbookCrawler {
+	return &KoshaEbookCrawler{BaseCrawler: BaseCrawler{Name: "kosha_ebook"}, seen: seen}
 }
 
 func (c *KoshaEbookCrawler) FetchPosts() ([]Post, error) {
@@ -61,14 +62,6 @@ func (c *KoshaEbookCrawler) FetchPosts() ([]Post, error) {
 
 	log.Printf("[kosha_ebook] %d posts parsed", len(posts))
 	return posts, nil
-}
-
-func (c *KoshaEbookCrawler) GetNewPosts() ([]Post, error) {
-	posts, err := c.FetchPosts()
-	if err != nil {
-		return nil, err
-	}
-	return FilterNewPosts(c.Name, posts), nil
 }
 
 func (c *KoshaEbookCrawler) parseItem(item *goquery.Selection) *Post {
@@ -123,12 +116,14 @@ func (c *KoshaEbookCrawler) parseItem(item *goquery.Selection) *Post {
 		PostID:       sdir,
 		Title:        title,
 		URL:          viewerURL,
-		Source:        "\uC6D4\uAC04 \uC548\uC804\uBCF4\uAC74", // 월간 안전보건
+		Source:       "\uC6D4\uAC04 \uC548\uC804\uBCF4\uAC74", // 월간 안전보건
 		DownloadURLs: dlURLs,
 	}
 
-	// Try to download the first PDF that fits within the size limit
-	if len(pdfFiles) > 0 {
+	// Try to download the first PDF that fits within the size limit.
+	// 이미 발송된(seen) 호는 첨부를 받지 않는다 — 목록에 남아 있는 과월호
+	// PDF 를 매 폴 새로 내려받고 dedup 뒤에서 버리던 낭비였다.
+	if len(pdfFiles) > 0 && (c.seen == nil || !c.seen(c.Name, post.PostID)) {
 		fileBytes, fileName := c.downloadPDF(sdir, pdfFiles)
 		if fileBytes != nil {
 			post.FileData = fileBytes
@@ -173,8 +168,22 @@ func (c *KoshaEbookCrawler) downloadPDF(sdir string, pdfFiles []string) ([]byte,
 			log.Printf("[kosha_ebook] PDF download failed: %v", err)
 			continue
 		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			log.Printf("[kosha_ebook] PDF download HTTP %d — skipping", resp.StatusCode)
+			continue
+		}
+		// download.jsp 는 실패 시에도 200 에러 페이지를 줄 수 있다 — HTML 이
+		// 그대로 'PDF' 첨부로 나가지 않게 막는다.
+		if ct := resp.Header.Get("Content-Type"); strings.HasPrefix(ct, "text/html") {
+			resp.Body.Close()
+			log.Printf("[kosha_ebook] PDF download got Content-Type %q — skipping", ct)
+			continue
+		}
 
-		data, err := io.ReadAll(resp.Body)
+		// HEAD 가 ContentLength 를 안 주면(-1) 위 상한 검사가 통과해 버리므로,
+		// 읽기 자체를 상한+1 로 자른다. 넘친 파일은 아래 크기 검사가 버린다.
+		data, err := io.ReadAll(io.LimitReader(resp.Body, ebookFileLimit+1))
 		resp.Body.Close()
 		if err != nil {
 			log.Printf("[kosha_ebook] PDF read failed: %v", err)

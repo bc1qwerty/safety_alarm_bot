@@ -129,11 +129,13 @@ func (c *KoshaNoticeCrawler) FetchPosts() ([]Post, error) {
 //     (totalCount=totalNormalCnt). Stickies are pinned notices with no
 //     sequential number, so they are dropped — matching the pre-SPA crawler,
 //     which filtered the DOM's non-numeric "공지" rows.
-//   - PostID is the board's visible "No" = mainTotal - rnum + 1. This MUST stay
-//     stable: the framework dedups on the exact (source, PostID) pair and
-//     bot_seen already holds these display numbers from the chromedp-era
-//     crawler. Emitting pstNo instead would make every backlog item look new
-//     and redispatch it.
+//   - PostID is the immutable pstNo (2026-09-13). It used to be the board's
+//     visible "No" = mainTotal - rnum + 1, but that number shifts down when
+//     KOSHA deletes a post, so the next new post reused an already-seen
+//     number and was silently dropped. bot_seen still holds those display
+//     numbers, so LegacyPostID carries the display number for the adapter's
+//     dual-key dedup shim (see source.CrawlerAdapter.Fetch) — without it
+//     every backlog item would look new and redispatch.
 //   - A regular pstNo with no matching title in bbsPstGrid is dropped with a
 //     WARN rather than emitted with an empty title.
 func buildKoshaPosts(pstNoGrid []koshaPstNoItem, bbsPstGrid []koshaBbsPstItem, totalNormalCnt int, source, detailURL string) []Post {
@@ -173,19 +175,12 @@ func buildKoshaPosts(pstNoGrid []koshaPstNoItem, bbsPstGrid []koshaBbsPstItem, t
 			continue
 		}
 		posts = append(posts, Post{
-			PostID: strconv.Itoa(displayNo),
-			Title:  title,
-			URL:    detailURL + e.PstNo,
-			Source: source,
+			PostID:       e.PstNo,
+			LegacyPostID: strconv.Itoa(displayNo),
+			Title:        title,
+			URL:          detailURL + e.PstNo,
+			Source:       source,
 		})
 	}
 	return posts
-}
-
-func (c *KoshaNoticeCrawler) GetNewPosts() ([]Post, error) {
-	posts, err := c.FetchPosts()
-	if err != nil {
-		return nil, err
-	}
-	return FilterNewPosts(c.Name, posts), nil
 }

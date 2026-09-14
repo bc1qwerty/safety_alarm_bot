@@ -13,8 +13,6 @@ var (
 	TelegramChatID   string
 	BandAccessToken  string
 	BandKey          string
-	DataDir          string
-	LastPostIDsPath  string
 )
 
 func Init() {
@@ -28,9 +26,6 @@ func Init() {
 	TelegramChatID = os.Getenv("TELEGRAM_CHAT_ID")
 	BandAccessToken = os.Getenv("BAND_ACCESS_TOKEN")
 	BandKey = os.Getenv("BAND_KEY")
-
-	DataDir = filepath.Join(projectRoot, "data")
-	LastPostIDsPath = filepath.Join(DataDir, "last_post_ids.json")
 }
 
 // InitWithRoot initializes config using an explicit project root path.
@@ -41,7 +36,4 @@ func InitWithRoot(projectRoot string) {
 	TelegramChatID = os.Getenv("TELEGRAM_CHAT_ID")
 	BandAccessToken = os.Getenv("BAND_ACCESS_TOKEN")
 	BandKey = os.Getenv("BAND_KEY")
-
-	DataDir = filepath.Join(projectRoot, "data")
-	LastPostIDsPath = filepath.Join(DataDir, "last_post_ids.json")
 }

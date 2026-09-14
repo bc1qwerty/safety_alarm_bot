@@ -199,11 +199,3 @@ func (c *KoshaAccidentCrawler) fetchPostsOnce() ([]Post, error) {
 	log.Printf("[kosha_accident] %d posts parsed", len(posts))
 	return posts, nil
 }
-
-func (c *KoshaAccidentCrawler) GetNewPosts() ([]Post, error) {
-	posts, err := c.FetchPosts()
-	if err != nil {
-		return nil, err
-	}
-	return FilterNewPosts(c.Name, posts), nil
-}

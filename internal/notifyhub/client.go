@@ -69,9 +69,19 @@ func LogPush(source, level, message, details string) error {
 
 	logURL := strings.Replace(hubURL, "/notifications/push", "/logs/push", 1)
 
-	body := fmt.Sprintf(`{"source":%q,"level":%q,"message":%q,"details":%q}`, source, level, message, details)
+	// ⚠fmt %q 수제 조립 금지: Go 의 \x1b 류 이스케이프는 JSON 으로는 불법이라,
+	// 제어문자가 든 에러 메시지를 허브가 400 으로 조용히 버렸다.
+	body, err := json.Marshal(struct {
+		Source  string `json:"source"`
+		Level   string `json:"level"`
+		Message string `json:"message"`
+		Details string `json:"details"`
+	}{source, level, message, details})
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
 
-	req, err := http.NewRequest("POST", logURL, bytes.NewReader([]byte(body)))
+	req, err := http.NewRequest("POST", logURL, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -83,5 +93,10 @@ func LogPush(source, level, message, details string) error {
 		return err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("logpush status %d: %s", resp.StatusCode, respBody)
+	}
 	return nil
 }

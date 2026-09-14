@@ -9,8 +9,8 @@ Construction safety notice crawler and notification bot. Scrapes notices from MO
 ## Tech Stack
 - **Language**: Go 1.24
 - **Scraping**: goquery + chromedp (headless Chrome for JS-rendered pages)
-- **Notifications**: Telegram Bot API + Naver Band API
-- **State**: JSON file (data/last_post_ids.json)
+- **Notifications**: Telegram Bot API + Naver Band API (via txid-bot-framework `pkg/notify` + `core.MultiNotifier`)
+- **State**: framework SQLite store (data/safety-alarm.db, bot_key namespace `safety-alarm`)
 - **Config**: godotenv
 
 ## Project Structure
@@ -24,13 +24,16 @@ internal/
     kosha_accident.go          # KOSHA accident report crawler (with images, chromedp)
     kosha_archive.go           # KOSHA archive crawler (OPS/booklet/video)
     kosha_ebook.go             # KOSHA eBook crawler (PDF downloads)
-    state.go                   # JSON state management (seen post IDs)
     types.go                   # Shared types (Post, DownloadURL)
-  notifier/
-    telegram.go                # Telegram: text, photo, document sending
-    band.go                    # Naver Band posting
-data/                          # Runtime state (last_post_ids.json)
+  source/
+    adapter.go                 # Crawler → framework core.Source adapter
+  notifyhub/
+    client.go                  # txid notification-hub push client
+data/                          # Runtime state (safety-alarm.db, framework store)
 ```
+Dedup/delivery state and Telegram/Band sending live in txid-bot-framework
+(`pkg/store`, `pkg/notify`); this repo keeps only the crawlers (moel/kosha
+split unchanged) and the Source adapter.
 
 ## Build & Run
 ```bash

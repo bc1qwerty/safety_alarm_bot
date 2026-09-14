@@ -16,14 +16,14 @@ import (
 	"github.com/bc1qwerty/safety-alarm-bot/internal/source"
 	"github.com/bc1qwerty/txid-bot-framework/pkg/bot"
 	"github.com/bc1qwerty/txid-bot-framework/pkg/core"
+	"github.com/bc1qwerty/txid-bot-framework/pkg/logsafe"
 	"github.com/bc1qwerty/txid-bot-framework/pkg/notify"
 	"github.com/bc1qwerty/txid-bot-framework/pkg/store"
 )
 
-
 const (
-	runTimeout      = 5 * time.Minute
-	maxSendPerRun   = 10
+	runTimeout    = 5 * time.Minute
+	maxSendPerRun = 10
 	// hubChannel is the txid notification-hub channel slug. It is NOT the
 	// Telegram chat id: the hub keys notifications by logical channel,
 	// while Telegram/Band delivery is handled separately by the
@@ -106,54 +106,6 @@ func main() {
 		log.Printf("Filter: SKIP=%s", skip)
 	}
 
-	// Apply ONLY/SKIP filter to the crawler list before adapting.
-	allCrawlers := []crawler.Crawler{
-		crawler.NewKoshaNoticeCrawler(),
-		crawler.NewKoshaAccidentCrawler(),
-		crawler.NewKoshaArchiveCrawler("ops"),
-		crawler.NewKoshaArchiveCrawler("video"),
-		crawler.NewKoshaArchiveCrawler("booklet"),
-		crawler.NewKoshaEbookCrawler(),
-		crawler.NewMoelCrawler(),
-	}
-	var crawlers []crawler.Crawler
-	for _, c := range allCrawlers {
-		if shouldRun(c.SiteName()) {
-			crawlers = append(crawlers, c)
-			continue
-		}
-		log.Printf("skipping crawler: %s", c.SiteName())
-	}
-	if len(crawlers) == 0 {
-		log.Println("no crawlers selected — nothing to do")
-		return
-	}
-
-	var sources []core.Source
-	for _, c := range crawlers {
-		sources = append(sources, source.NewAdapter(c))
-	}
-	multiSource := core.NewMultiSource(sources...)
-
-	// Multi-channel notifier — Telegram (HTML) and Band (plain-text).
-	// MultiNotifier reports success if at least one channel delivered,
-	// so a Band outage no longer causes Telegram duplicates next poll.
-	var notifiers []core.Notifier
-	if config.TelegramBotToken != "" {
-		tg, err := notify.NewTelegram(config.TelegramBotToken)
-		if err != nil {
-			log.Fatalf("Telegram init: %v", err)
-		}
-		notifiers = append(notifiers, tg)
-	}
-	if config.BandAccessToken != "" && config.BandKey != "" {
-		notifiers = append(notifiers, notify.NewBand(config.BandAccessToken, config.BandKey))
-	}
-	if len(notifiers) == 0 {
-		log.Fatal("no notifier configured (need TELEGRAM_BOT_TOKEN or BAND_ACCESS_TOKEN)")
-	}
-	multiNotifier := core.NewMultiNotifier(notifiers...)
-
 	dbPath := filepath.Join(projectRoot, "data", "safety-alarm.db")
 	st, err := store.Open(dbPath, hubChannel)
 	if err != nil {
@@ -176,17 +128,86 @@ func main() {
 		_ = st.Subscribe(config.TelegramChatID)
 	}
 
+	// seen 은 (site, postID) 가 이미 bot_seen 에 있는지 본다 — 크롤러는
+	// 첨부 다운로드를 건너뛰는 데, 어댑터는 kosha 키 전환 심에 쓴다. 조회
+	// 실패는 "안 봄"으로 두는데, 그런 항목은 프레임워크의 IsSeen 도 같은
+	// 이유로 실패해 dispatch 없이 건너뛰므로 오발송으로 이어지지 않는다.
+	seen := func(site, postID string) bool {
+		ok, err := st.IsSeen(site, source.ItemID(site, postID))
+		return err == nil && ok
+	}
+
+	// Apply ONLY/SKIP filter to the crawler list before adapting.
+	allCrawlers := []crawler.Crawler{
+		crawler.NewKoshaNoticeCrawler(),
+		crawler.NewKoshaAccidentCrawler(),
+		crawler.NewKoshaArchiveCrawler("ops", seen),
+		crawler.NewKoshaArchiveCrawler("video", seen),
+		crawler.NewKoshaArchiveCrawler("booklet", seen),
+		crawler.NewKoshaEbookCrawler(seen),
+		crawler.NewMoelCrawler(),
+	}
+	var crawlers []crawler.Crawler
+	for _, c := range allCrawlers {
+		if shouldRun(c.SiteName()) {
+			crawlers = append(crawlers, c)
+			continue
+		}
+		log.Printf("skipping crawler: %s", c.SiteName())
+	}
+	if len(crawlers) == 0 {
+		log.Println("no crawlers selected — nothing to do")
+		return
+	}
+
+	var sources []core.Source
+	for _, c := range crawlers {
+		sources = append(sources, source.NewAdapter(c, seen))
+	}
+	multiSource := core.NewMultiSource(sources...)
+
+	// Multi-channel notifier — Telegram (HTML) and Band (plain-text).
+	// MultiNotifier reports success if at least one channel delivered,
+	// so a Band outage no longer causes Telegram duplicates next poll.
+	var notifiers []core.Notifier
+	if config.TelegramBotToken != "" {
+		tg, err := notify.NewTelegram(config.TelegramBotToken)
+		if err != nil {
+			log.Fatalf("Telegram init: %v", err)
+		}
+		notifiers = append(notifiers, tg)
+	}
+	if config.BandAccessToken != "" && config.BandKey != "" {
+		notifiers = append(notifiers, notify.NewBand(config.BandAccessToken, config.BandKey))
+	}
+	if len(notifiers) == 0 {
+		log.Fatal("no notifier configured (need TELEGRAM_BOT_TOKEN or BAND_ACCESS_TOKEN)")
+	}
+	multiNotifier := core.NewMultiNotifier(notifiers...)
+	// 부분 실패(예: 텔레그램만 강퇴되고 밴드는 성공)는 Send 가 nil 을 돌려줘
+	// Runner 의 OnError·영구수신자 가드에 절대 닿지 않는다 — 허브 로그로
+	// 승격해 표면화한다. 영구 판정(IsPermanentRecipient)은 채널이 스스로
+	// 회복하지 못하니 메시지에 구별해 남긴다.
+	multiNotifier.OnPartialFailure = func(name string, err error) {
+		kind := "일시"
+		if core.IsPermanentRecipient(err) {
+			kind = "영구"
+		}
+		_ = notifyhub.LogPush("safety-alarm-bot", "error",
+			logsafe.Mask(fmt.Sprintf("채널 부분 실패(%s, %s): %v — 다른 채널은 성공해 재발송 없음", name, kind, err)), "")
+	}
+
 	runner := bot.New(bot.Config{
-		Name:            hubChannel,
-		Source:          multiSource,
-		Formatter:       &SafetyFormatter{},
-		Notifier:        multiNotifier,
-		Store:           st,
-		ArchiveDir:      archiveDir(projectRoot),
-		HeartbeatDir:    heartbeatDir(),
+		Name:              hubChannel,
+		Source:            multiSource,
+		Formatter:         &SafetyFormatter{},
+		Notifier:          multiNotifier,
+		Store:             st,
+		ArchiveDir:        archiveDir(projectRoot),
+		HeartbeatDir:      heartbeatDir(),
 		MaxItemsPerPoll:   maxSendPerRun,
 		ArchiveRetainDays: 30,
-		BootstrapMode:   os.Getenv("BOOTSTRAP_DEDUP") == "1",
+		BootstrapMode:     os.Getenv("BOOTSTRAP_DEDUP") == "1",
 		OnNewItem: func(ctx context.Context, item core.Item) error {
 			return notifyhub.Push(notifyhub.Payload{
 				ChannelID: hubChannel,
@@ -196,7 +217,10 @@ func main() {
 			})
 		},
 		OnError: func(err error) {
-			_ = notifyhub.LogPush("safety-alarm-bot", "error", err.Error(), "")
+			// 텔레그램 오류는 *url.Error 로 토큰이 든 URL 을 담을 수 있다.
+			// 허브로 나가기 전에 토큰 형태를 원천에서 가린다 — 외부 sed
+			// 파이프 없이도 평문 토큰이 프로세스 밖으로 안 나가게.
+			_ = notifyhub.LogPush("safety-alarm-bot", "error", logsafe.Mask(err.Error()), "")
 		},
 		OnPollComplete: func(ctx context.Context, n int) error {
 			return notifyhub.LogPush("safety-alarm-bot", "info",

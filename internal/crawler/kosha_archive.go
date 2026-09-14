@@ -20,15 +20,15 @@ const (
 )
 
 var archiveShpCd = map[string]string{
-	"ops":      "12",
-	"video":    "02",
-	"booklet":  "14",
+	"ops":     "12",
+	"video":   "02",
+	"booklet": "14",
 }
 
 var archiveDetailURL = map[string]string{
-	"ops":      archiveBaseURL + "/archive/cent-archive/master-arch/master-list1/master-detail1",
-	"video":    archiveBaseURL + "/archive/cent-archive/master-arch/master-list2/master-detail2",
-	"booklet":  archiveBaseURL + "/archive/cent-archive/master-arch/master-list3/master-detail3",
+	"ops":     archiveBaseURL + "/archive/cent-archive/master-arch/master-list1/master-detail1",
+	"video":   archiveBaseURL + "/archive/cent-archive/master-arch/master-list2/master-detail2",
+	"booklet": archiveBaseURL + "/archive/cent-archive/master-arch/master-list3/master-detail3",
 }
 
 // KoshaArchiveCrawler crawls 안전보건공단 자료실 (OPS/booklet/video).
@@ -36,13 +36,15 @@ type KoshaArchiveCrawler struct {
 	BaseCrawler
 	ContentType string
 	shpCd       string
+	seen        SeenFunc
 }
 
-func NewKoshaArchiveCrawler(contentType string) *KoshaArchiveCrawler {
+func NewKoshaArchiveCrawler(contentType string, seen SeenFunc) *KoshaArchiveCrawler {
 	return &KoshaArchiveCrawler{
 		BaseCrawler: BaseCrawler{Name: "kosha_archive_" + contentType},
 		ContentType: contentType,
 		shpCd:       archiveShpCd[contentType],
+		seen:        seen,
 	}
 }
 
@@ -88,7 +90,16 @@ func (c *KoshaArchiveCrawler) FetchPosts() ([]Post, error) {
 			PostID: medSeq,
 			Title:  title,
 			URL:    detailURL,
-			Source:  "\uC548\uC804\uBCF4\uAC74\uACF5\uB2E8 \uC790\uB8CC\uC2E4", // 안전보건공단 자료실
+			Source: "\uC548\uC804\uBCF4\uAC74\uACF5\uB2E8 \uC790\uB8CC\uC2E4", // 안전보건공단 자료실
+		}
+
+		// 이미 발송된(seen) 항목의 첨부는 받지 않는다. 목록에 남아 있는 기존
+		// 항목의 PDF(최대 50MB)를 매 폴 새로 내려받고는 dedup 뒤에서 그대로
+		// 버리던 낭비이자 5분 runTimeout 압박 요인이었다. 메타데이터는 그대로
+		// 내보내므로 seen 판정 자체는 여전히 프레임워크 몫이다.
+		if c.seen != nil && c.seen(c.Name, post.PostID) {
+			posts = append(posts, post)
+			continue
 		}
 
 		switch c.ContentType {
@@ -139,14 +150,6 @@ func (c *KoshaArchiveCrawler) FetchPosts() ([]Post, error) {
 
 	log.Printf("[%s] %d posts parsed", c.Name, len(posts))
 	return posts, nil
-}
-
-func (c *KoshaArchiveCrawler) GetNewPosts() ([]Post, error) {
-	posts, err := c.FetchPosts()
-	if err != nil {
-		return nil, err
-	}
-	return FilterNewPosts(c.Name, posts), nil
 }
 
 // httpMaxAttempts bounds retries for the archive/notice JSON APIs, mirroring
@@ -253,10 +256,10 @@ func (c *KoshaArchiveCrawler) downloadThumbnail(thumbAtcflNo string) []byte {
 
 func (c *KoshaArchiveCrawler) getFileInfo(atcflNo string) *archiveFileInfo {
 	body := map[string]interface{}{
-		"fileId":              atcflNo,
-		"fileUploadType":      "02",
-		"atcflTaskColNm":      "lastFile",
-		"atcflSeTaskComCdNm":  "Y",
+		"fileId":             atcflNo,
+		"fileUploadType":     "02",
+		"atcflTaskColNm":     "lastFile",
+		"atcflSeTaskComCdNm": "Y",
 	}
 	jsonBody, _ := json.Marshal(body)
 
@@ -314,10 +317,10 @@ func (c *KoshaArchiveCrawler) downloadFile(atcflNo string) ([]byte, string) {
 
 func (c *KoshaArchiveCrawler) downloadBlob(atcflNo string, seq int) []byte {
 	body := map[string]interface{}{
-		"fileId":    atcflNo,
-		"seq":       seq,
-		"taskSeCd":  "10",
-		"isDirect":  "N",
+		"fileId":   atcflNo,
+		"seq":      seq,
+		"taskSeCd": "10",
+		"isDirect": "N",
 	}
 	jsonBody, _ := json.Marshal(body)
 
@@ -337,9 +340,15 @@ func (c *KoshaArchiveCrawler) downloadBlob(atcflNo string, seq int) []byte {
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(resp.Body)
+	// 서버가 신고한 크기(AtcflSz)를 그대로 믿지 않는다 — 상한+1 로 잘라 읽고
+	// 실제로 넘치면 버린다.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, tgFileLimit+1))
 	if err != nil {
 		log.Printf("[%s] file read failed: %v", c.Name, err)
+		return nil
+	}
+	if int64(len(data)) > tgFileLimit {
+		log.Printf("[%s] file exceeds telegram size limit — skipping attachment", c.Name)
 		return nil
 	}
 	return data
