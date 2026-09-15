@@ -165,10 +165,14 @@ jobs:
           else
             TEXT="🟠 safety_alarm dedup 감시 불능%0A${REASON}"
           fi
-          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+          # ⚠ 2026-09-15: 이 경보가 자기 실패를 삼키고 있었다. `-s … || true` 는 401·403·429 를
+          #   전부 exit 0 으로 덮어서, dedup 캐시 유실이라는 «사람이 봐야 하는» 신호가
+          #   말없이 사라질 수 있었다. 실패해도 봇 실행은 계속해야 하므로(여기서 죽이면
+          #   이번 주기가 통째로 날아간다) 잡을 세우지는 않고 ::error:: 로 남긴다.
+          curl -sS --fail-with-body -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
             -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
             -d text="${TEXT}%0A로그: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            > /dev/null || true
+            > /dev/null || echo "::error::경보 텔레그램 발송 실패 — dedup 유실이 사람에게 닿지 않았다"
 
       - name: Run bot (skip moel — runs from dell instead, see Korean IP requirement)
         env:
