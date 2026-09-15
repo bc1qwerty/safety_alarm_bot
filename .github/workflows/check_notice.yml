@@ -6,7 +6,15 @@ on:
     # KST 08:07~18:37 사이 30분 간격 실행
     # UTC 23:07~09:37
     #
-    # ⚠분(minute)을 0,30 이 아니라 7,37 로 둔 이유: GitHub 의 스케줄러는
+    # ⚠**이 schedule 은 이제 폴백이다.** 주 트리거는 맥 launchd
+  #   `uk.txid.gha-dispatch-safety-alarm`(30분, 평일 KST 08~18시)이 `gh workflow run`
+  #   으로 깨운다. 맥이 꺼져 있을 때만 아래 cron 이 의미가 있다.
+  # ⚠**분 오프셋 조정은 효과가 없었다 — 다시 시도하지 말 것.** 0,30 → 7,37 로 옮기고
+  #   24.3시간 재측정한 결과 설계 약 21슬롯 대비 **3회(14%)** 였다(2026-09-15).
+  #   형제 리포 best-archive 도 같은 조정 후 6.6→4.7회/일로 오히려 줄었다.
+  #   GitHub 의 cron 배달은 best-effort 이고 우리가 돌릴 손잡이는 여기 없다.
+  # (아래는 그때의 근거 기록)
+  # ⚠분(minute)을 0,30 이 아니라 7,37 로 둔 이유: GitHub 의 스케줄러는
     #   정시·30분 정각에 가장 붐벼 큐잉이 심하다(공식 문서도 "run at a
     #   different time of the hour" 권고). 0,30 이던 2026-09-02~11 실측은
     #   설계 22회/일 중 3~4회만 실행됐고(00:42/04:06/09:02/13:43Z 패턴),
@@ -31,6 +39,15 @@ permissions:
 # have no Node-24 release yet, so this env var covers them all at once.
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+# ⚠**동시 실행을 막아야 한다.** 이 워크플로는 dedup DB 를 캐시에서 restore 하고 끝에
+#   save 한다 — 두 실행이 겹치면 늦게 끝난 쪽이 상대의 seen 기록을 덮어써 **이미 보낸
+#   공지를 다시 보내거나 새 공지를 조용히 삼킨다.** 2026-09-15 에 맥 launchd 디스패처를
+#   붙여 실행 빈도를 설계값으로 되돌리면서(아래 schedule 주석 참고) 겹칠 여지가 생겼다.
+#   cancel-in-progress 는 false 다 — 돌던 폴을 죽이면 그 회차가 통째로 유실된다.
+concurrency:
+  group: safety-alarm-bot
+  cancel-in-progress: false
 
 jobs:
   check:
