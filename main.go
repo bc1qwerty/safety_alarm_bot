@@ -117,6 +117,13 @@ func main() {
 	// TRUNCATE checkpoint the restored DB next run is schema-only and the
 	// bot redispatches the same kosha_* backlog every 30 minutes.
 	defer func() {
+		// One-shot runs never reach the daemon-only runCleanup (bot.Run starts
+		// it; we only call PollOnce), so prune old dedup rows here with the same
+		// retention as the daemon default. Must run *before* the checkpoint —
+		// otherwise the DELETEs stay in the -wal sidecar that GHA's cache drops.
+		if err := st.Cleanup(90 * 24 * time.Hour); err != nil {
+			log.Printf("store cleanup warning: %v", err)
+		}
 		if db := st.DB(); db != nil {
 			if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
 				log.Printf("[wal_checkpoint] %v", err)
