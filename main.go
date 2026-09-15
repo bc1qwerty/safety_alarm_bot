@@ -24,6 +24,13 @@ import (
 const (
 	runTimeout    = 5 * time.Minute
 	maxSendPerRun = 10
+	// dedupRetain 은 bot_seen/bot_sent 보존기간이다. 프레임워크 기본값 90일은
+	// 소스 목록의 수명보다 짧았다: MOEL 공지·KOSHA 자료실은 12개월치를 계속
+	// 노출하므로, 90일이 지나 dedup 행이 지워지면 **그대로 남아 있는 목록의
+	// 옛 글이 신규로 다시 잡혀 재발송**된다. 2026-09-15 실측으로 터졌다 —
+	// 정리가 194행을 지우고 이미 보낸 월간지 백호 9건이 재발송됐다.
+	// 보존은 소스 수명보다 길어야 한다. food-recall 이 같은 이유로 2년을 쓴다.
+	dedupRetain = 2 * 365 * 24 * time.Hour
 	// hubChannel is the txid notification-hub channel slug. It is NOT the
 	// Telegram chat id: the hub keys notifications by logical channel,
 	// while Telegram/Band delivery is handled separately by the
@@ -119,9 +126,11 @@ func main() {
 	defer func() {
 		// One-shot runs never reach the daemon-only runCleanup (bot.Run starts
 		// it; we only call PollOnce), so prune old dedup rows here with the same
-		// retention as the daemon default. Must run *before* the checkpoint —
-		// otherwise the DELETEs stay in the -wal sidecar that GHA's cache drops.
-		if err := st.Cleanup(90 * 24 * time.Hour); err != nil {
+		// dedupRetain the Config below declares — **이 호출이 이 봇의 유일한
+		// 정리 경로다.** Config 쪽만 고치면 아무 효과가 없다. Must run *before*
+		// the checkpoint — otherwise the DELETEs stay in the -wal sidecar that
+		// GHA's cache drops.
+		if err := st.Cleanup(dedupRetain); err != nil {
 			log.Printf("store cleanup warning: %v", err)
 		}
 		if db := st.DB(); db != nil {
@@ -213,6 +222,7 @@ func main() {
 		ArchiveDir:        archiveDir(projectRoot),
 		HeartbeatDir:      heartbeatDir(),
 		MaxItemsPerPoll:   maxSendPerRun,
+		RetainDuration:    dedupRetain,
 		ArchiveRetainDays: 30,
 		BootstrapMode:     os.Getenv("BOOTSTRAP_DEDUP") == "1",
 		OnNewItem: func(ctx context.Context, item core.Item) error {
