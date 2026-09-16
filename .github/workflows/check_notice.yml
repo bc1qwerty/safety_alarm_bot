@@ -89,7 +89,15 @@ jobs:
           cache: true
 
       - name: Install Chrome
-        uses: browser-actions/setup-chrome@v1
+        # ⚠ 2026-09-16: 서드파티 액션을 **이동 태그가 아니라 커밋 SHA** 로 고정한다.
+        # `@v3` 같은 태그는 업스트림이 언제든 옮길 수 있고, 그 순간 이 워크플로가
+        # 새 코드를 그대로 실행한다 — 봇 시크릿이 있는 잡에서 돈다.
+        # 고정한 SHA 는 **고정 시점에 그 태그가 가리키던 바로 그 커밋**이라 동작은 달라지지 않는다.
+        # ⚠핀은 저절로 갱신되지 않는다. 가끔 사람이 확인할 것(세 줄):
+        #   gh api repos/browser-actions/setup-chrome/git/ref/tags/v1 --jq .object.sha
+        #   gh api repos/browser-actions/setup-chrome/releases/latest --jq .tag_name
+        #   (태그가 옮겨졌으면 위 SHA 가 아래 핀과 달라진다)
+        uses: browser-actions/setup-chrome@c785b87e244131f27c9f19c1a33e2ead956ab7ce # v1
         with:
           chrome-version: stable
 
