@@ -52,6 +52,12 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # ⚠ 2026-09-16 신설. 없으면 멎은 한 회차가 GitHub 기본 **360분**까지 in_progress 로
+    #   남는다. 그 사이 launchd 디스패처(gha-dispatch.sh)는 busy 를 보고 exit 0 으로
+    #   조용히 넘어가므로 연속실패 카운터가 오르지 않아 **경보 임계에 영영 닿지 않는다**.
+    #   concurrency 가 cancel-in-progress: false 라 폴백 cron 도 함께 밀린다.
+    #   형제 best-archive bot.yml 은 12분을 쓴다 — 같은 값으로 맞춘다.
+    timeout-minutes: 12
 
     steps:
       - uses: actions/checkout@v4
