@@ -98,9 +98,15 @@ func shouldRun(name string) bool {
 	return true
 }
 
+// frameworkRev 는 빌드 시 -ldflags 로 주입된다(CI 의 "Capture framework revision").
+// go.mod 의 replace 때문에 빌드정보에는 프레임워크가 (devel) 로만 남아, 이것이 없으면
+// 프로드 바이너리가 어느 프레임워크 커밋으로 만들어졌는지 알 방법이 없다.
+// 로컬 빌드에서는 "unknown" 이고, 그 자체가 «릴리스본이 아니다» 라는 신호다.
+var frameworkRev = "unknown"
+
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime)
-	log.Println("=== Safety Alarm Bot (Framework Mode) starting ===")
+	log.Printf("=== Safety Alarm Bot (Framework Mode) starting === framework=%s", frameworkRev)
 	_ = notifyhub.LogPush("safety-alarm-bot", "info", "run started", "")
 
 	projectRoot := resolveProjectRoot()

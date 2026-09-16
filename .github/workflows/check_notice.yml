@@ -74,6 +74,14 @@ jobs:
       - name: Stage framework sibling
         run: mv txid-bot-framework-checkout ../txid-bot-framework
 
+      # ⚠ 2026-09-16 신설. go.mod 의 `replace => ../txid-bot-framework` 때문에 빌드정보에는
+      #   프레임워크가 `(devel)` 로만 남아, **프로드 바이너리가 어느 프레임워크 커밋으로
+      #   만들어졌는지 알 수 없다.** 이 함대는 그 때문에 두 번 헤맸다(nara-bot·bangool-bot).
+      #   ldflags 는 `go version -m` 의 build 설정으로 남고(실증함) 기동 로그에도 찍힌다.
+      - name: Capture framework revision
+        id: fwrev
+        run: echo "sha=$(git -C ../txid-bot-framework rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
@@ -94,7 +102,7 @@ jobs:
         run: go test ./...
 
       - name: Build
-        run: go build -o safety-alarm-bot .
+        run: go build -ldflags="-X main.frameworkRev=${{ steps.fwrev.outputs.sha }}" -o safety-alarm-bot .
 
       # Persist bot_seen across runs. Without this every scheduled run
       # starts from an empty SQLite and would treat the existing
