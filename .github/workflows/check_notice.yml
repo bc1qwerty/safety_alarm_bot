@@ -85,7 +85,16 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          # ⚠ 2026-09-16: '1.24' → '1.26'. 선언이 **거짓이었고 그 대가가 실제 취약점이었다.**
+          #   go.mod 가 `go 1.25.0` 이라 Go 가 자동 승격해 실제로는 go1.25.0 으로 빌드됐다
+          #   (CI 로그: "Setup go version spec 1.24" / "go version go1.25.0"). 즉 선언한
+          #   1.24 는 아무 의미가 없었고, 대신 **go.mod 의 최소값에 정확히 고정**됐다.
+          #   실측(govulncheck, GOTOOLCheck 툴체인 고정): go1.25.0 에서 도달 가능한
+          #   stdlib 취약점 **24건**(crypto/x509 포함 — notifyhub 의 HTTPS 호출로 도달),
+          #   go1.26.8 에서 **0건**. 형제 bid-alert·food-recall·realestate 는 이미 1.26 이다.
+          #   ⚠`go-version-file: go.mod` 로 바꾸지 않는다 — 그러면 최소값(1.25.0)에 다시
+          #     고정돼 지금 상태로 되돌아간다. 최소 요구와 «빌드에 쓸 툴체인» 은 다른 값이다.
+          go-version: '1.26'
           cache: true
 
       - name: Install Chrome
